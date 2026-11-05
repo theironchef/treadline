@@ -777,14 +777,17 @@ select {
   border-radius: 16px;
 }
 
+/* Locked: black in either theme, which costs an OLED screen almost nothing
+   while it has to stay on, with a dim glance at distance and time. */
 .lock-layer {
   position: fixed;
   inset: 0;
-  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  background: #000;
   display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  padding-bottom: calc(40px + env(safe-area-inset-bottom));
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  padding: 22vh 16px calc(40px + env(safe-area-inset-bottom));
   touch-action: none;
   z-index: 10;
 }
@@ -793,17 +796,36 @@ select {
   display: none;
 }
 
+.lock-glance {
+  text-align: center;
+  color: #5c6168;
+}
+
+.lock-glance b {
+  display: block;
+  font-size: 76px;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: #8a8f98;
+}
+
+.lock-glance span {
+  display: block;
+  margin-top: 6px;
+  font-size: 18px;
+}
+
 .lock-ring {
   width: 120px;
   height: 120px;
   border-radius: 50%;
-  border: 3px solid var(--line);
-  background: var(--surface);
+  border: 3px solid #26282c;
+  background: #0a0a0b;
   display: grid;
   place-items: center;
   text-align: center;
   font-size: 14px;
-  color: var(--muted);
+  color: #6b7078;
   user-select: none;
   transition: border-color 1.2s linear, transform 1.2s linear;
 }

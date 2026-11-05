@@ -296,9 +296,11 @@ async function startRun() {
   };
   S.active.timers = [setInterval(syncSums, 3000), setInterval(saveActive, 10000)];
   S.locked = false;
+  lockWarned = false;
   wakeLock(true);
   speak(`${outdoor ? 'Outdoor' : 'Indoor'} run started.${target ? ` Target ${fmt.spokenDistance(target, S.settings.units)}.` : ''}`);
   go('live');
+  armAutoLock();
 }
 
 async function syncSums() {
@@ -342,6 +344,7 @@ async function togglePause() {
   await S.link.control(a.paused ? CMD.PAUSE : CMD.RESUME);
   speak(a.paused ? 'Paused' : 'Resumed');
   renderLive();
+  if (!a.paused) armAutoLock();
 }
 
 async function finishRun() {
@@ -521,17 +524,58 @@ function announce(a) {
   if (events.length) speak(announcement(events, tl, S.settings.units));
 }
 
+// A page gets no GPS or motion data with the screen off, so a run holds the
+// screen on. If that's refused (Battery Saver can), say so once per run.
 let lock = null;
+let lockWarned = false;
 async function wakeLock(on) {
   try {
     if (on && !lock && navigator.wakeLock) {
       lock = await navigator.wakeLock.request('screen');
-      lock.addEventListener('release', () => (lock = null));
+      lock.addEventListener('release', () => {
+        lock = null;
+        // Let go mid-run while the app is on screen (Battery Saver switching
+        // on, say): take it again.
+        if (S.active && document.visibilityState === 'visible') wakeLock(true);
+      });
     } else if (!on && lock) {
-      await lock.release();
+      const held = lock;
       lock = null;
+      await held.release();
     }
-  } catch {}
+  } catch {
+    if (on && !lockWarned) {
+      lockWarned = true;
+      toast('The screen can’t be kept on (Battery Saver?). Tracking stops whenever it turns off.');
+    }
+  }
+}
+
+// ---------- screen lock ----------
+
+// The app's own lock against pocket taps, since the phone's real one would
+// turn the screen off. It locks by itself after AUTO_LOCK_MS without a touch
+// while running, though not while paused or typing a treadmill speed.
+const AUTO_LOCK_MS = 8000;
+let autoLock = null;
+
+function armAutoLock() {
+  clearTimeout(autoLock);
+  autoLock = setTimeout(() => {
+    const a = S.active;
+    if (a && !a.paused && !a.segmentForm && S.screen === 'live') setLocked(true);
+  }, AUTO_LOCK_MS);
+}
+
+function setLocked(on) {
+  S.locked = on;
+  if ($('lockLayer')) $('lockLayer').hidden = !on;
+  if (!on) armAutoLock();
+}
+
+// Any touch or typing mid-run postpones the lock.
+for (const type of ['pointerdown', 'keydown', 'input']) {
+  document.addEventListener(type, () => S.active && !S.locked && armAutoLock(), true);
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -1041,6 +1085,7 @@ function live() {
       <div id="seg"></div>
       <div id="controls" class="controls"></div>
       <div id="lockLayer" class="lock-layer" hidden>
+        <div class="lock-glance"><b id="lockDist">0.00</b><span>${u.label}</span><span id="lockTime">0:00</span></div>
         <div class="lock-ring" id="unlock"><span>Hold to unlock</span></div>
       </div>
     </section>`;
@@ -1092,6 +1137,8 @@ function updateLive() {
   const elapsed = (p && p.sessionId === a.sessionId ? p.elapsedMs : a.lastSums.elapsedMs) / 1000;
   $('dist').textContent = fmt.distance(rs.shown, units);
   $('time').textContent = fmt.clock(elapsed);
+  $('lockDist').textContent = $('dist').textContent;
+  $('lockTime').textContent = $('time').textContent;
   $('pace').textContent = a.paused ? '–:––' : fmt.pace(rs.currentSpeed, units);
   // Outdoors GPS bridges a gap, so the gap's time counts toward the average.
   $('avg').textContent = fmt.paceFromSeconds(elapsed - (a.track ? 0 : (p?.gapMs ?? 0) / 1000), rs.shown, units);
@@ -1382,7 +1429,7 @@ function calibrate() {
       <label class="check-row"><input id="voice" type="checkbox" ${S.settings.voice ? 'checked' : ''}> Voice updates each ${u.word} and at halfway</label>
       <div class="row">
         <button class="btn small ghost" data-act="export">Export data</button>
-        <label class="btn small ghost">Import<input id="import" type="file" accept="application/json" hidden></label>
+        <label class="btn small ghost">Import<input id="import" type="file" accept="application/json,text/plain,.json,.txt" hidden></label>
       </div>
       <p class="hint">Version ${BUILD} · <button class="link" data-act="checkUpdate">Check for updates</button></p>
     </section>
@@ -1490,10 +1537,7 @@ const actions = {
     S.active.segment = null;
     renderSegment();
   },
-  lock: () => {
-    S.locked = true;
-    $('lockLayer').hidden = false;
-  },
+  lock: () => setLocked(true),
   deleteObs: async (el) => {
     if (!confirm('Delete this measurement?')) return;
     const ids = el.dataset.ids.split(',');
@@ -1625,9 +1669,8 @@ $app.addEventListener('pointerdown', (e) => {
   if (!e.target.closest('#unlock')) return;
   $('unlock').classList.add('holding');
   unlockTimer = setTimeout(() => {
-    S.locked = false;
-    $('lockLayer').hidden = true;
     $('unlock').classList.remove('holding');
+    setLocked(false);
   }, 1200);
 });
 const cancelUnlock = () => {
@@ -1648,14 +1691,26 @@ function toast(text) {
 
 // ---------- backup ----------
 
-function exportData() {
+async function exportData() {
   // 'treadline' is the export format's id from before the rename; keep it so
   // old and new backups import either way.
   const data = { app: 'treadline', version: 1, settings: S.settings, runs: S.runs, observations: S.observations };
-  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  const json = JSON.stringify(data);
+  const name = `run-club-${new Date().toISOString().slice(0, 10)}`;
+  // On a phone, the share sheet can save it straight to Drive or attach it
+  // to an email. Chrome only shares a few file types, so it goes as text.
+  const file = new File([json], `${name}.txt`, { type: 'text/plain' });
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: 'Run Club data' });
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+    }
+  }
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `run-club-${new Date().toISOString().slice(0, 10)}.json`;
+  a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+  a.download = `${name}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }

@@ -74,10 +74,16 @@ measurement keeps outdoor calibration honest.
   run, and each spot keeps its own calibration. The finish screen shows what
   it detected; change it there if it's wrong. (Calibrate → Phone placement
   can fix it to one spot instead.)
-- **Keep the app open with the screen on.** Browsers stop sending motion and GPS data
-  to pages in the background. The app keeps the screen awake during a run,
-  and **Lock screen** stops pocket taps (hold to unlock). Any time with no
-  data is flagged, and that run is left out of calibration by default.
+- **Don't lock the phone itself during a run.** Browsers stop sending motion
+  and GPS data to a page once the screen is off, and no web app can change
+  that. Instead the app keeps the screen awake and locks itself after 8
+  seconds without a touch: a black screen (almost free on an OLED display)
+  with a dim distance and time, which ignores pocket taps until you hold the
+  ring to unlock. If the screen can't be kept on (Battery Saver can refuse),
+  it says so. Any time with no data is flagged, and that run is left out of
+  calibration by default.
+- **Export data** (Calibrate tab) opens the share sheet, so a backup can go
+  straight to Drive or into an email.
 - **Calibrate:**
   - *Fastest, on a treadmill:* during an indoor run, tap **Calibrate at this
     speed**, type the treadmill speed, hold it 1–2 minutes and tap **Save
