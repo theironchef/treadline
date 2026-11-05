@@ -1,24 +1,43 @@
 import * as store from './store.js';
 import { fit, prior, predict, features, diffMoments, summarize, speed, REF, UNCALIBRATED_ERROR } from './model.js';
-import { RunSession, rescale, splits } from './run.js';
+import { RunSession, Chunker, rescale, splits, milestones, announcement, usableChunk } from './run.js';
 import { CMD } from './sensor.js';
 import { PhoneLink, SimLink } from './links.js';
+import { PhoneGps, SimGps, GpsTrack } from './gps.js';
 import * as fmt from './format.js';
 import { UNITS } from './format.js';
 
 const params = new URLSearchParams(location.search);
-// ?sim or ?sim=20 swaps the phone's accelerometer for a simulated runner.
+// ?sim or ?sim=20 swaps the phone's accelerometer (and GPS) for a simulated
+// runner.
 const SIM = params.has('sim') ? Number(params.get('sim')) || 1 : 0;
 
 const PLACEMENTS = { pocket: 'Front pocket', armband: 'Armband', waist: 'Waistband' };
 const MIN_SEGMENT_S = 60;
+// GPS stretches are noisier than a treadmill's readout, so they count for less.
+const GPS_SIGMA = 0.02;
+// A GPS stretch this far from the current model is assumed bad (a GPS jump,
+// the phone moved) and isn't used.
+const MAX_GPS_ERR = 0.25;
+const WHEEL_ITEM = 40;
+const MAX_TARGET = 50;
 
 const S = {
-  settings: { units: 'mi', heightM: 1.75, placement: 'pocket', voice: true, segmentSpeed: '' },
+  // Saved as-is; targetM is meters, 0 for an open run.
+  settings: {
+    units: 'mi',
+    heightM: 1.75,
+    placement: 'pocket',
+    voice: true,
+    segmentSpeed: '',
+    mode: 'treadmill',
+    targetM: 3 * UNITS.mi.meters,
+  },
   runs: [],
   observations: [],
   model: null,
   link: null,
+  gps: null,
   live: null,
   screen: 'home',
   runId: null,
@@ -26,6 +45,10 @@ const S = {
   finish: null,
   locked: false,
 };
+
+// In the simulator, devtools can reach the state, e.g. to fast-forward with
+// treadline.link._tick().
+if (SIM) window.treadline = S;
 
 const $app = document.getElementById('app');
 const source = () => (SIM ? 'sim' : S.settings.placement);
@@ -55,7 +78,9 @@ async function boot() {
 }
 
 function refit() {
-  const obs = S.observations.filter((o) => o.source === source());
+  const obs = S.observations
+    .filter((o) => o.source === source())
+    .map((o) => (o.kind === 'gps' ? { ...o, group: o.runId } : o));
   S.model = fit(obs, prior(S.settings.heightM));
   S.active?.rs.setBeta(S.model.beta);
 }
@@ -89,7 +114,8 @@ function onLive(p) {
   const a = S.active;
   if (a && p.sessionId === a.sessionId) {
     a.rs.onLive(p);
-    announceSplit(a);
+    if (a.chunker) S.link.readSums().then((sums) => a.chunker.update(a.track.snapshot(), sums));
+    announce(a);
   }
   if (S.screen === 'live') updateLive();
   else if (S.screen === 'home') updateCheck();
@@ -103,32 +129,83 @@ function signal(p) {
   return { cls: 'weak', text: 'Weak signal' };
 }
 
+// ---------- GPS ----------
+
+function gps() {
+  if (!S.gps) {
+    S.gps = SIM ? new SimGps(link()) : new PhoneGps();
+    S.gps.addEventListener('fix', (e) => {
+      const a = S.active;
+      if (a?.track && !a.paused) a.track.add(e.detail);
+      if (S.screen === 'home') updateCheck();
+    });
+    S.gps.addEventListener('status', () => S.screen === 'home' && updateCheck());
+  }
+  return S.gps;
+}
+
+// GPS runs during outdoor runs and on the start screen in outdoor mode (so
+// it has a fix by the time you start), and is off otherwise to save battery.
+function syncGps() {
+  const want = S.active?.track || (S.screen === 'home' && S.settings.mode === 'outdoor');
+  if (!want) S.gps?.stop();
+  else if (SIM || PhoneGps.supported()) {
+    if (gps().status !== 'denied') gps().start();
+  }
+}
+
+function gpsSignal() {
+  const g = S.gps;
+  if (!SIM && !PhoneGps.supported()) return { cls: 'weak', text: 'No GPS in this browser' };
+  if (!g || g.status === 'off') return { cls: 'off', text: 'GPS off' };
+  if (g.status === 'denied') return { cls: 'weak', text: 'Location blocked' };
+  if (g.status === 'error') return { cls: 'weak', text: 'GPS unavailable' };
+  if (!g.last) return { cls: 'idle', text: 'Finding GPS…' };
+  if (performance.now() - g.lastAt > 10000) return { cls: 'weak', text: 'GPS signal lost' };
+  const acc = Math.round(g.last.accuracy);
+  return acc <= 15 ? { cls: 'ok', text: `GPS ±${acc} m` } : { cls: 'weak', text: `GPS weak ±${acc} m` };
+}
+
 // ---------- run lifecycle ----------
 
 async function startRun() {
+  saveTarget();
+  const outdoor = S.settings.mode === 'outdoor';
+  if (outdoor) {
+    if (!SIM && !PhoneGps.supported()) return toast('This browser has no location access');
+    gps().start();
+    if (S.gps.status === 'denied') return toast(S.gps.message);
+  }
   const l = link();
   if (!l.connected) await enableSensor();
   if (!l.connected) return;
+  if (outdoor && !S.gps.last) toast('No GPS fix yet. Distance starts counting once it locks on.');
   await l.control(CMD.START);
   const sums = await l.readSums();
-  const rs = new RunSession(S.model.beta);
+  const track = outdoor ? new GpsTrack() : null;
+  const rs = new RunSession(S.model.beta, null, track);
   rs.onSums(sums);
+  const target = S.settings.targetM >= 0.05 * unit().meters ? S.settings.targetM : 0;
   S.active = {
     id: store.newId(),
     startedAt: Date.now(),
     sessionId: sums.sessionId,
     source: source(),
+    mode: outdoor ? 'outdoor' : 'treadmill',
+    target,
+    track,
+    chunker: outdoor ? new Chunker() : null,
     rs,
     lastSums: sums,
     paused: false,
     segment: null,
     segmentForm: false,
-    announced: 0,
+    spokenTo: 0,
   };
   S.active.timers = [setInterval(syncSums, 3000), setInterval(saveActive, 10000)];
   S.locked = false;
   wakeLock(true);
-  speak('Run started');
+  speak(`${outdoor ? 'Outdoor' : 'Treadmill'} run started.${target ? ` Target ${fmt.spokenDistance(target, S.settings.units)}.` : ''}`);
   go('live');
 }
 
@@ -145,19 +222,28 @@ async function syncSums() {
 function saveActive() {
   const a = S.active;
   if (!a) return;
-  store.setKv('activeRun', {
+  store.setKv('activeRun', runState(a, a.lastSums));
+}
+
+function runState(a, sums) {
+  return {
     id: a.id,
     startedAt: a.startedAt,
     source: a.source,
-    sums: a.lastSums,
+    mode: a.mode,
+    target: a.target,
+    sums,
     timeline: a.rs.timeline,
-  });
+    gps: a.track?.snapshot(),
+    chunker: a.chunker?.toJSON(),
+  };
 }
 
 async function togglePause() {
   const a = S.active;
   a.paused = !a.paused;
   if (a.paused) a.segment = null;
+  if (a.track) a.paused ? a.track.pause() : a.track.resume();
   await S.link.control(a.paused ? CMD.PAUSE : CMD.RESUME);
   speak(a.paused ? 'Paused' : 'Resumed');
   renderLive();
@@ -168,58 +254,74 @@ async function finishRun() {
   await S.link.control(CMD.PAUSE);
   const sums = await S.link.readSums();
   await S.link.control(CMD.STOP);
+  a.track?.pause();
   a.timers.forEach(clearInterval);
   S.active = null;
   wakeLock(false);
-  openFinish({ id: a.id, startedAt: a.startedAt, source: a.source, sums, timeline: a.rs.timeline });
+  openFinish(runState(a, sums));
 }
 
 function openFinish(saved) {
-  const estimate = predict(S.model.beta, features(saved.sums.moments));
-  S.finish = { ...saved, estimate, treadmillHint: S.link?.treadmillMeters };
+  const beta = S.model.beta;
+  const estimate = predict(beta, features(saved.sums.moments));
+  let outdoor = null;
+  if (saved.mode === 'outdoor') {
+    const chunks = new Chunker(saved.chunker).finish(saved.gps, saved.sums);
+    const good = chunks.filter(
+      (c) => usableChunk(c) && Math.abs(predict(beta, features(c.moments)) / c.distance - 1) <= MAX_GPS_ERR,
+    );
+    // Without a GPS fix there's nothing better than the accelerometer.
+    const gpsOk = saved.gps.fixes > 1 && saved.gps.distance > 0;
+    outdoor = { good, gpsOk, distance: gpsOk ? saved.gps.distance : estimate };
+  }
+  S.finish = { ...saved, estimate, outdoor, simTruth: S.link?.treadmillMeters };
   store.setKv('activeRun', saved);
   go('finish');
 }
 
 async function saveRun() {
   const f = S.finish;
-  const typed = parseFloat($('treadmill').value);
+  const o = f.outdoor;
+  const typed = o ? NaN : parseFloat($('treadmill').value);
   const treadmill = typed > 0 ? typed * unit().meters : null;
-  const distance = treadmill ?? f.estimate;
+  const distance = o ? o.distance : (treadmill ?? f.estimate);
   const sum = summarize(f.sums.moments);
   const run = {
     id: f.id,
     startedAt: f.startedAt,
     source: f.source,
+    mode: o ? 'outdoor' : 'treadmill',
+    target: f.target ?? 0,
     seconds: f.sums.elapsedMs / 1000,
     gapSeconds: f.sums.gapMs / 1000,
     distance,
     estimate: f.estimate,
     treadmill: !!treadmill,
+    gps: o?.gpsOk ? { accuracy: f.gps.accuracySum / f.gps.fixes, gapSeconds: f.gps.gapMs / 1000 } : null,
     steps: f.sums.steps,
     cadence: sum.cadence,
     moments: f.sums.moments,
-    timeline: rescale(f.timeline, distance),
+    timeline: o ? f.timeline : rescale(f.timeline, distance),
   };
   await store.put('runs', run);
   S.runs.unshift(run);
-  if (treadmill) {
-    const o = {
-      id: `run-${f.id}`,
-      runId: f.id,
-      kind: 'run',
-      source: f.source,
-      t: f.startedAt,
-      moments: f.sums.moments,
-      distance: treadmill,
-      seconds: run.seconds,
-      sigma: 0.01,
-      include: $('useCal').checked,
-    };
-    await store.put('observations', o);
-    S.observations.push(o);
-    refit();
+  const base = { runId: f.id, source: f.source, t: f.startedAt, include: $('useCal').checked };
+  const obs = treadmill
+    ? [{ ...base, id: `run-${f.id}`, kind: 'run', moments: f.sums.moments, distance: treadmill, seconds: run.seconds, sigma: 0.01 }]
+    : (o?.good ?? []).map((c, k) => ({
+        ...base,
+        id: `gps-${f.id}-${k}`,
+        kind: 'gps',
+        moments: c.moments,
+        distance: c.distance,
+        seconds: c.seconds,
+        sigma: GPS_SIGMA,
+      }));
+  for (const x of obs) {
+    await store.put('observations', x);
+    S.observations.push(x);
   }
+  if (obs.length) refit();
   await store.deleteKv('activeRun');
   S.finish = null;
   S.unfinished = null;
@@ -285,18 +387,16 @@ function speak(text) {
   speechSynthesis.speak(new SpeechSynthesisUtterance(text));
 }
 
-function announceSplit(a) {
-  const u = unit();
-  const k = Math.floor(a.rs.shown / u.meters);
-  if (k <= a.announced) return;
-  a.announced = k;
-  const full = splits(a.rs.timeline, u.meters).filter((s) => s.fraction === 1);
-  const last = full[full.length - 1];
-  if (!last) return;
-  const word = u.label === 'mi' ? (k === 1 ? 'mile' : 'miles') : k === 1 ? 'kilometer' : 'kilometers';
-  const m = Math.floor(last.seconds / 60);
-  const s = Math.round(last.seconds % 60);
-  speak(`${k} ${word}. Split ${m} minutes ${s} seconds.`);
+// Each mile (or km), halfway and the target: the split and the average pace.
+// spokenTo only moves forward, so a mid-run recalibration that lowers the
+// distance doesn't repeat anything.
+function announce(a) {
+  const tl = a.rs.timeline;
+  const d = tl[tl.length - 1]?.d ?? 0;
+  if (d <= a.spokenTo) return;
+  const events = milestones(a.spokenTo, d, unit().meters, a.target);
+  a.spokenTo = d;
+  if (events.length) speak(announcement(events, tl, S.settings.units));
 }
 
 let lock = null;
@@ -328,8 +428,12 @@ function render() {
   const screens = { home, live, finish, run: runDetail, calibrate };
   $app.innerHTML = screens[S.screen]();
   document.body.dataset.screen = S.screen;
+  syncGps();
   if (S.screen === 'live') renderLive();
-  if (S.screen === 'home') updateCheck();
+  if (S.screen === 'home') {
+    mountWheels();
+    updateCheck();
+  }
 }
 
 function nav(active) {
@@ -358,29 +462,46 @@ function home() {
     .slice(0, 30)
     .map(
       (r) => `<button class="run-row" data-act="openRun" data-id="${r.id}">
-        <span class="run-date">${fmt.date(r.startedAt)}<small>${fmt.time(r.startedAt)}</small></span>
+        <span class="run-date">${fmt.date(r.startedAt)}<small>${r.mode === 'outdoor' ? 'Outdoor' : 'Treadmill'} · ${fmt.time(r.startedAt)}</small></span>
         <span class="run-dist">${fmt.distance(r.distance, S.settings.units)}<small>${u.label}</small></span>
         <span class="run-meta">${fmt.clock(r.seconds)}<small>${fmt.paceFromSeconds(r.seconds, r.distance, S.settings.units)} /${u.label}</small></span>
       </button>`,
     )
     .join('');
+  const outdoor = S.settings.mode === 'outdoor';
+  const modeBtn = (m, label) =>
+    `<button role="radio" aria-checked="${S.settings.mode === m}" class="${S.settings.mode === m ? 'on' : ''}" data-act="mode" data-mode="${m}">${label}</button>`;
+  const items = (n) => Array.from({ length: n }, (_, i) => `<div class="wheel-item" data-act="wheelPick" data-i="${i}">${i}</div>`).join('');
   return `
     <header class="top"><h1>Treadline</h1>${SIM ? '<span class="pill">Simulator</span>' : ''}</header>
     ${unfinished}
+    <div class="mode" role="radiogroup" aria-label="Where you're running">${modeBtn('treadmill', 'Treadmill')}${modeBtn('outdoor', 'Outdoor')}</div>
+    <section class="card target">
+      <div class="sensor-head"><span class="label">Target distance</span><span id="targetNote" class="label"></span></div>
+      <div class="picker">
+        <div class="wheel" id="wWhole" tabindex="0" role="spinbutton" aria-label="Whole ${u.word}s" aria-valuemin="0" aria-valuemax="${MAX_TARGET}">${items(MAX_TARGET + 1)}</div>
+        <span class="picker-dot">.</span>
+        <div class="wheel tenth" id="wTenth" tabindex="0" role="spinbutton" aria-label="Tenths" aria-valuemin="0" aria-valuemax="9">${items(10)}</div>
+        <span class="picker-unit">${u.label}</span>
+      </div>
+    </section>
     <section class="card sensor">
       <div class="sensor-head">
-        <span class="label">Sensor · ${SIM ? 'Simulated runner' : PLACEMENTS[S.settings.placement]}</span>
+        <span class="label">Steps · ${SIM ? 'Simulated runner' : PLACEMENTS[S.settings.placement]}</span>
         <span id="checkSig" class="sig"></span>
       </div>
       <div class="check"><b id="checkCad">–</b><span>steps / min</span></div>
+      ${outdoor ? '<div class="sensor-head gps-row"><span class="label">Location</span><span id="gpsSig" class="sig"></span></div><p id="gpsHint" class="warn" hidden></p>' : ''}
       <p class="hint">${
         SIM
-          ? 'A simulated runner follows a treadmill program: 3 min walk, then 6, 7 and 6.5 mph.'
-          : 'Put the phone where it will ride during the run and walk around. The cadence here should match your steps.'
+          ? 'A simulated runner follows a program: 3 min walk, then 6, 7 and 6.5 mph.'
+          : outdoor
+            ? 'GPS measures the distance. The accelerometer records too, and steady stretches calibrate it for the treadmill.'
+            : 'Put the phone where it will ride during the run and walk around. The cadence here should match your steps.'
       }</p>
       ${S.link?.connected ? '' : '<button class="btn small" data-act="enable">Enable motion sensor</button>'}
     </section>
-    <button class="btn start" data-act="start">Start treadmill run</button>
+    <button class="btn start" data-act="start">Start ${outdoor ? 'outdoor' : 'treadmill'} run</button>
     <button class="cal-line" data-act="go" data-to="calibrate">${calibrationLine()} →</button>
     <h2>Runs</h2>
     <div class="runs">${runs || '<p class="empty">No runs yet.</p>'}</div>
@@ -395,17 +516,87 @@ function updateCheck() {
     $('checkSig').className = `sig ${sig.cls}`;
     $('checkSig').textContent = sig.text;
   }
+  if ($('gpsSig')) {
+    const g = gpsSignal();
+    $('gpsSig').className = `sig ${g.cls}`;
+    $('gpsSig').textContent = g.text;
+    $('gpsHint').hidden = S.gps?.status !== 'denied';
+    $('gpsHint').textContent = S.gps?.message ?? '';
+  }
+}
+
+// ---------- target wheel ----------
+
+// Two scroll-snap wheels, whole units and tenths. The value is read from the
+// scroll position, and saved once the wheel settles.
+function mountWheels() {
+  const tenths = Math.min(MAX_TARGET * 10 + 9, Math.round((S.settings.targetM / unit().meters) * 10));
+  for (const [el, i] of [
+    [$('wWhole'), Math.floor(tenths / 10)],
+    [$('wTenth'), tenths % 10],
+  ]) {
+    el.scrollTop = i * WHEEL_ITEM;
+    paintWheel(el);
+    let settle = null;
+    el.addEventListener(
+      'scroll',
+      () => {
+        requestAnimationFrame(() => paintWheel(el));
+        clearTimeout(settle);
+        settle = setTimeout(saveTarget, 150);
+      },
+      { passive: true },
+    );
+    el.addEventListener('keydown', (e) => {
+      const step = { ArrowUp: -1, ArrowDown: 1 }[e.key];
+      if (!step) return;
+      e.preventDefault();
+      el.scrollBy({ top: step * WHEEL_ITEM, behavior: 'smooth' });
+    });
+  }
+  updateTargetNote();
+}
+
+const wheelIndex = (el) => Math.round(el.scrollTop / WHEEL_ITEM);
+const wheelTarget = () => wheelIndex($('wWhole')) + wheelIndex($('wTenth')) / 10;
+
+// Tilts items away from the center, like a drum.
+function paintWheel(el) {
+  const mid = el.scrollTop / WHEEL_ITEM;
+  [...el.children].forEach((item, i) => {
+    const off = Math.max(-3, Math.min(3, i - mid));
+    item.style.transform = `rotateX(${(-off * 22).toFixed(1)}deg)`;
+    item.style.opacity = (1 - Math.abs(off) * 0.3).toFixed(2);
+    item.classList.toggle('on', i === Math.round(mid));
+  });
+  el.setAttribute('aria-valuenow', Math.round(mid));
+  updateTargetNote();
+}
+
+function updateTargetNote() {
+  const el = $('targetNote');
+  if (!el || !$('wTenth')) return;
+  const v = wheelTarget();
+  el.textContent = v > 0 ? `Halfway at ${Number((v / 2).toFixed(2))} ${unit().label}` : 'Open run';
+}
+
+function saveTarget() {
+  if (!$('wWhole')) return;
+  S.settings.targetM = wheelTarget() * unit().meters;
+  saveSettings();
 }
 
 function live() {
   const u = unit();
+  const a = S.active;
   return `
     <section class="live">
       <header class="live-top">
-        <span id="sig" class="sig"></span>
+        <span class="sigs">${a?.track ? '<span id="gpsSig" class="sig"></span>' : ''}<span id="sig" class="sig"></span></span>
         <button class="btn small ghost" data-act="lock">Lock screen</button>
       </header>
       <div class="hero"><b id="dist">0.00</b><span>${u.label}</span></div>
+      ${a?.target ? '<div class="goal"><div class="goal-bar"><i id="goalFill"></i><s></s></div><span id="goalText"></span></div>' : ''}
       <div class="stats">
         <div><b id="pace">–:––</b><span>Pace /${u.label}</span></div>
         <div><b id="time">0:00</b><span>Time</span></div>
@@ -439,7 +630,7 @@ function renderSegment() {
   const el = $('seg');
   if (!a || !el) return;
   const u = unit();
-  if (a.paused) {
+  if (a.paused || a.track) {
     el.innerHTML = '';
   } else if (a.segment) {
     el.innerHTML = `<div class="card seg active">
@@ -470,16 +661,30 @@ function updateLive() {
   $('dist').textContent = fmt.distance(rs.shown, units);
   $('time').textContent = fmt.clock(elapsed);
   $('pace').textContent = a.paused ? '–:––' : fmt.pace(rs.currentSpeed, units);
-  $('avg').textContent = fmt.paceFromSeconds(elapsed - (p?.gapMs ?? 0) / 1000, rs.shown, units);
+  // Outdoors GPS bridges a gap, so the gap's time counts toward the average.
+  $('avg').textContent = fmt.paceFromSeconds(elapsed - (a.track ? 0 : (p?.gapMs ?? 0) / 1000), rs.shown, units);
   $('spd').textContent = a.paused ? '0.0' : (rs.currentSpeed * unit().speedFactor).toFixed(1);
   $('cad').textContent = p ? Math.round(p.cadence) : 0;
   $('steps').textContent = p ? p.steps.toLocaleString() : 0;
   const sig = signal(p);
   $('sig').className = `sig ${a.paused ? 'idle' : sig.cls}`;
   $('sig').textContent = a.paused ? 'Paused' : sig.text;
+  if ($('gpsSig')) {
+    const g = gpsSignal();
+    $('gpsSig').className = `sig ${g.cls}`;
+    $('gpsSig').textContent = g.text;
+  }
+  if ($('goalFill')) {
+    const left = a.target - rs.shown;
+    $('goalFill').style.width = `${Math.min(100, (rs.shown / a.target) * 100).toFixed(1)}%`;
+    $('goalText').textContent =
+      left > 0 ? `${fmt.distance(left, units)} ${unit().label} to go of ${fmt.distance(a.target, units)}` : 'Target reached';
+  }
   const gap = p?.gapMs ?? 0;
   $('gap').hidden = gap === 0;
-  if (gap) $('gap').textContent = `${fmt.clock(gap / 1000)} not tracked: the screen went off or the app was in the background. Keep this screen open while running.`;
+  if (gap) {
+    $('gap').textContent = `${fmt.clock(gap / 1000)} ${a.track ? 'without step data' : 'not tracked'}: the screen went off or the app was in the background. Keep this screen open while running.`;
+  }
   if (a.segment && $('segTime')) {
     const s = (elapsed * 1000 - a.segment.start.elapsedMs) / 1000;
     $('segTime').textContent = fmt.clock(s);
@@ -488,14 +693,61 @@ function updateLive() {
 }
 
 function finish() {
+  return S.finish.outdoor ? finishOutdoor() : finishTreadmill();
+}
+
+function finishOutdoor() {
+  const f = S.finish;
+  const o = f.outdoor;
+  const u = unit();
+  const units = S.settings.units;
+  const gap = f.sums.gapMs / 1000;
+  const sum = summarize(f.sums.moments);
+  const err = f.estimate / o.distance - 1;
+  const usedM = o.good.reduce((s, c) => s + c.distance, 0);
+  const sim =
+    f.simTruth > 0
+      ? `<p class="hint">Simulator: the true distance was ${fmt.distance(f.simTruth, units)} ${u.label}, so GPS was ${(Math.abs(o.distance / f.simTruth - 1) * 100).toFixed(1)}% ${o.distance > f.simTruth ? 'long' : 'short'}.</p>`
+      : '';
+  const calibration = !o.gpsOk
+    ? '<p class="warn">GPS never got a fix, so the distance is the accelerometer’s estimate and this run can’t calibrate anything.</p>'
+    : `<p class="hint">On its own, the accelerometer measured ${fmt.distance(f.estimate, units)} ${u.label}: ${(Math.abs(err) * 100).toFixed(1)}% ${err > 0 ? 'long' : 'short'} of GPS.</p>
+      ${
+        o.good.length
+          ? `<p class="hint">${fmt.distance(usedM, units)} ${u.label} had steady GPS and step data, in ${o.good.length} ${o.good.length === 1 ? 'stretch' : 'stretches'}. Those calibrate the accelerometer for treadmill runs.</p>`
+          : '<p class="warn">GPS or step data was too patchy to calibrate from this run.</p>'
+      }`;
+  return `
+    <header class="top"><h1>Run complete</h1></header>
+    <section class="card">
+      <div class="stats">
+        <div><b>${fmt.clock(f.sums.elapsedMs / 1000)}</b><span>Time</span></div>
+        <div><b>${fmt.distance(o.distance, units)}</b><span>${o.gpsOk ? 'GPS' : 'Estimate'} (${u.label})</span></div>
+        <div><b>${Math.round(sum.cadence)}</b><span>Avg cadence</span></div>
+      </div>
+    </section>
+    ${gap > 0 ? `<p class="warn">${fmt.clock(gap)} of this run had no step data, so those stretches are left out of calibration.</p>` : ''}
+    <section class="card">
+      <h3>Accelerometer calibration</h3>
+      ${calibration}
+      ${sim}
+      <label class="check-row"><input id="useCal" type="checkbox" ${o.good.length ? 'checked' : 'disabled'}> Use this run to calibrate</label>
+    </section>
+    <div class="row end">
+      <button class="btn ghost" data-act="discard">Discard</button>
+      <button class="btn" data-act="save">Save run</button>
+    </div>`;
+}
+
+function finishTreadmill() {
   const f = S.finish;
   const u = unit();
   const units = S.settings.units;
   const gap = f.sums.gapMs / 1000;
   const sum = summarize(f.sums.moments);
   const hint =
-    f.treadmillHint > 0
-      ? `<button class="link" data-act="fillHint">Simulated treadmill shows ${fmt.distance(f.treadmillHint, units)} ${u.label}</button>`
+    f.simTruth > 0
+      ? `<button class="link" data-act="fillHint">Simulated treadmill shows ${fmt.distance(f.simTruth, units)} ${u.label}</button>`
       : '';
   return `
     <header class="top"><h1>Run complete</h1></header>
@@ -545,9 +797,13 @@ function runDetail() {
   const u = unit();
   const units = S.settings.units;
   const sp = splits(r.timeline, u.meters);
-  const compare = r.treadmill
-    ? `<p class="hint">App estimate ${fmt.distance(r.estimate, units)} ${u.label} (${fmt.percent(r.estimate / r.distance - 1)}) vs treadmill ${fmt.distance(r.distance, units)} ${u.label}.</p>`
-    : '<p class="hint">Saved without a treadmill distance, so this is the app’s estimate.</p>';
+  const compare = r.gps
+    ? `<p class="hint">Outdoor run measured by GPS (±${Math.round(r.gps.accuracy)} m). The accelerometer alone said ${fmt.distance(r.estimate, units)} ${u.label} (${fmt.percent(r.estimate / r.distance - 1)}).</p>`
+    : r.mode === 'outdoor'
+      ? '<p class="hint">Outdoor run without a GPS fix, so this is the accelerometer’s estimate.</p>'
+      : r.treadmill
+        ? `<p class="hint">App estimate ${fmt.distance(r.estimate, units)} ${u.label} (${fmt.percent(r.estimate / r.distance - 1)}) vs treadmill ${fmt.distance(r.distance, units)} ${u.label}.</p>`
+        : '<p class="hint">Saved without a treadmill distance, so this is the app’s estimate.</p>';
   const rows = sp
     .map(
       (s) => `<tr><td>${s.fraction === 1 ? s.n : s.fraction.toFixed(2)}</td><td>${fmt.clock(s.seconds / s.fraction)}</td><td>${fmt.clock(s.seconds)}</td></tr>`,
@@ -599,19 +855,37 @@ function calibrate() {
   const u = unit();
   const m = S.model;
   const obs = S.observations.filter((o) => o.source === source()).sort((a, b) => b.t - a.t);
-  const list = obs
-    .map((o) => {
+  // An outdoor run's GPS stretches are listed (and switched on or off) as one.
+  const groups = [];
+  const byRun = new Map();
+  for (const o of obs) {
+    if (o.kind !== 'gps') groups.push([o]);
+    else if (byRun.has(o.runId)) byRun.get(o.runId).push(o);
+    else {
+      byRun.set(o.runId, [o]);
+      groups.push(byRun.get(o.runId));
+    }
+  }
+  const list = groups
+    .map((g) => {
+      const o = g[0];
+      const meters = g.reduce((s, x) => s + x.distance, 0);
+      // Left-out errors are per group already; in-sample ones are summed.
       const loo = m.error?.byId[o.id];
-      const err = loo ?? predict(m.beta, features(o.moments)) / o.distance - 1;
+      const err = loo ?? g.reduce((s, x) => s + predict(m.beta, features(x.moments)), 0) / meters - 1;
       const what =
         o.kind === 'segment'
           ? `Segment · ${fmt.escape(o.label)} · ${fmt.clock(o.seconds)}`
-          : `Run · ${fmt.distance(o.distance, S.settings.units)} ${u.label}`;
-      return `<div class="obs ${o.include === false ? 'off' : ''}">
-        <label class="check-row"><input type="checkbox" data-act="toggleObs" data-id="${o.id}" ${o.include === false ? '' : 'checked'}>
-          <span><b>${what}</b><small>${fmt.date(o.t)}${o.include === false ? '' : ` · ${loo != null ? 'predicted' : 'fit'} ${fmt.percent(err)}`}</small></span>
+          : o.kind === 'gps'
+            ? `Outdoor run · ${fmt.distance(meters, S.settings.units)} ${u.label} by GPS`
+            : `Run · ${fmt.distance(o.distance, S.settings.units)} ${u.label}`;
+      const ids = g.map((x) => x.id).join(',');
+      const on = o.include !== false;
+      return `<div class="obs ${on ? '' : 'off'}">
+        <label class="check-row"><input type="checkbox" data-act="toggleObs" data-ids="${ids}" ${on ? 'checked' : ''}>
+          <span><b>${what}</b><small>${fmt.date(o.t)}${on ? ` · ${loo != null ? 'predicted' : 'fit'} ${fmt.percent(err)}` : ''}</small></span>
         </label>
-        <button class="x" data-act="deleteObs" data-id="${o.id}" aria-label="Delete">×</button>
+        <button class="x" data-act="deleteObs" data-ids="${ids}" aria-label="Delete">×</button>
       </div>`;
     })
     .join('');
@@ -641,6 +915,7 @@ function calibrate() {
       <ol class="steps">
         <li><b>Fastest:</b> during a run, tap <i>Calibrate at this speed</i>, type the treadmill speed and hold it for 1–2 minutes. Do this at an easy, a moderate and a fast speed, plus a walk.</li>
         <li><b>Every run:</b> type the treadmill's distance when you finish. Each run makes the next one more accurate.</li>
+        <li><b>Outdoors:</b> run in Outdoor mode with the phone carried the same way. GPS measures the distance, and every steady half mile or so calibrates the accelerometer automatically. Treadmill strides can differ a little from road strides, so a treadmill measurement now and then keeps it honest.</li>
       </ol>
     </section>
     <h2>Measurements</h2>
@@ -652,7 +927,7 @@ function calibrate() {
       </label>
       <label class="field">Height ${height}</label>
       <p class="hint">Height sets the starting guess before any calibration.</p>
-      <label class="check-row"><input id="voice" type="checkbox" ${S.settings.voice ? 'checked' : ''}> Announce splits</label>
+      <label class="check-row"><input id="voice" type="checkbox" ${S.settings.voice ? 'checked' : ''}> Voice updates each ${u.word} and at halfway</label>
       <div class="row">
         <button class="btn small ghost" data-act="export">Export data</button>
         <label class="btn small ghost">Import<input id="import" type="file" accept="application/json" hidden></label>
@@ -720,16 +995,29 @@ const actions = {
     render();
   },
   fillHint: () => {
-    $('treadmill').value = fmt.distance(S.finish.treadmillHint, S.settings.units);
+    $('treadmill').value = fmt.distance(S.finish.simTruth, S.settings.units);
     updateCompare();
   },
+  mode: (el) => {
+    saveTarget();
+    S.settings.mode = el.dataset.mode;
+    saveSettings();
+    // A tap is the moment to ask for location permission, even if it was
+    // refused before.
+    if (S.settings.mode === 'outdoor' && (SIM || PhoneGps.supported())) gps().start();
+    render();
+  },
+  wheelPick: (el) => el.closest('.wheel').scrollTo({ top: el.dataset.i * WHEEL_ITEM, behavior: 'smooth' }),
   openRun: (el) => go('run', { runId: el.dataset.id }),
   deleteRun: async (el) => {
-    if (!confirm('Delete this run? Its calibration measurement is deleted too.')) return;
-    await store.remove('runs', el.dataset.id);
-    await store.remove('observations', `run-${el.dataset.id}`);
-    S.runs = S.runs.filter((r) => r.id !== el.dataset.id);
-    S.observations = S.observations.filter((o) => o.id !== `run-${el.dataset.id}`);
+    if (!confirm('Delete this run? Its calibration measurements are deleted too.')) return;
+    const id = el.dataset.id;
+    // Treadmill segments stand on their own, so they stay.
+    const gone = S.observations.filter((o) => o.runId === id && o.kind !== 'segment');
+    await store.remove('runs', id);
+    for (const o of gone) await store.remove('observations', o.id);
+    S.runs = S.runs.filter((r) => r.id !== id);
+    S.observations = S.observations.filter((o) => !gone.includes(o));
     refit();
     go('home');
   },
@@ -754,8 +1042,9 @@ const actions = {
   },
   deleteObs: async (el) => {
     if (!confirm('Delete this measurement?')) return;
-    await store.remove('observations', el.dataset.id);
-    S.observations = S.observations.filter((o) => o.id !== el.dataset.id);
+    const ids = el.dataset.ids.split(',');
+    for (const id of ids) await store.remove('observations', id);
+    S.observations = S.observations.filter((o) => !ids.includes(o.id));
     refit();
     render();
   },
@@ -771,9 +1060,11 @@ $app.addEventListener('click', (e) => {
 $app.addEventListener('change', async (e) => {
   const el = e.target;
   if (el.dataset.act === 'toggleObs') {
-    const o = S.observations.find((x) => x.id === el.dataset.id);
-    o.include = el.checked;
-    await store.put('observations', o);
+    const ids = el.dataset.ids.split(',');
+    for (const o of S.observations.filter((x) => ids.includes(x.id))) {
+      o.include = el.checked;
+      await store.put('observations', o);
+    }
     refit();
     render();
   } else if (el.id === 'placement') {

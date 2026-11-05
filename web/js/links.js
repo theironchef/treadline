@@ -1,4 +1,4 @@
-import { CadenceEstimator, Session, STATE, FLAG } from './sensor.js';
+import { CadenceEstimator, Session, CMD, STATE, FLAG } from './sensor.js';
 
 // Sensor links. Each runs the estimator once a second and emits:
 //   'status' — 'disconnected' | 'connected'
@@ -154,6 +154,11 @@ export class SimLink extends LocalLink {
 
   async pick() {
     this._startTicking(1000 / this.#speedup);
+  }
+
+  async control(cmd) {
+    if (cmd === CMD.START) this.treadmillMeters = 0;
+    return super.control(cmd);
   }
 
   _now() {

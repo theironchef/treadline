@@ -219,7 +219,136 @@ b {
   padding: 6px;
 }
 
+/* run type + target wheel */
+
+.mode {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.mode button {
+  appearance: none;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 650;
+  padding: 10px;
+  cursor: pointer;
+}
+
+.mode button.on {
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.picker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 160px;
+  margin-top: 4px;
+}
+
+.picker::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 60px;
+  height: 40px;
+  background: var(--surface-2);
+  border-radius: 10px;
+}
+
+.wheel {
+  position: relative;
+  height: 100%;
+  width: 72px;
+  padding: 60px 0;
+  overflow-y: auto;
+  scroll-snap-type: y mandatory;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  perspective: 240px;
+  -webkit-mask-image: linear-gradient(transparent, #000 30%, #000 70%, transparent);
+  mask-image: linear-gradient(transparent, #000 30%, #000 70%, transparent);
+  border-radius: 10px;
+  outline: none;
+}
+
+.wheel::-webkit-scrollbar {
+  display: none;
+}
+
+.wheel:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.wheel-item {
+  height: 40px;
+  line-height: 40px;
+  padding-right: 4px;
+  text-align: right;
+  font-size: 28px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  scroll-snap-align: center;
+  user-select: none;
+  cursor: pointer;
+  backface-visibility: hidden;
+}
+
+.wheel.tenth {
+  width: 44px;
+}
+
+.wheel.tenth .wheel-item {
+  padding: 0 0 0 2px;
+  text-align: left;
+}
+
+.wheel-item.on {
+  color: var(--text);
+}
+
+.picker-dot,
+.picker-unit {
+  position: relative;
+  font-size: 28px;
+  font-weight: 700;
+}
+
+.picker-unit {
+  margin-left: 10px;
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
 /* sensor check */
+
+.gps-row {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.sigs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
 
 .sensor-head {
   display: flex;
@@ -359,6 +488,44 @@ b {
 
 .hero.small b {
   font-size: 64px;
+}
+
+.goal {
+  margin: -8px 0 22px;
+}
+
+.goal-bar {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.goal-bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.4s;
+}
+
+/* Halfway tick */
+.goal-bar s {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--bg);
+}
+
+.goal span {
+  display: block;
+  margin-top: 6px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--muted);
 }
 
 .stats {

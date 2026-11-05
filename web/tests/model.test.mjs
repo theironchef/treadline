@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { emptyMoments, features, fit, predict, prior, speed, diffMoments } from '../js/model.js';
-import { rescale, splits } from '../js/run.js';
+import { rescale, splits, milestones, announcement, crossingTime } from '../js/run.js';
+import { spokenDuration, spokenDistance } from '../js/format.js';
 
 // A runner whose true step length is not the prior's: longer strides that
 // grow faster with cadence and with intensity.
@@ -100,4 +101,58 @@ test('splits interpolate mile crossings', () => {
   assert.ok(Math.abs(s[2].fraction - (3600 - 2 * 1609.344) / 1609.344) < 1e-6);
   const r = rescale(tl, 3960);
   assert.ok(Math.abs(r[r.length - 1].d - 3960) < 0.1);
+});
+
+test('milestones fire once each for miles, halfway and the target', () => {
+  const MI = 1609.344;
+  const target = 3.1 * MI;
+  const seen = [];
+  let d0 = 0;
+  for (let d = 0; d <= 3.3 * MI; d += 7) {
+    seen.push(...milestones(d0, d, MI, target).map((e) => e.kind + (e.k ?? '')));
+    d0 = d;
+  }
+  assert.deepEqual(seen, ['split1', 'half', 'split2', 'split3', 'target']);
+  assert.deepEqual(milestones(0, 5000, MI, 0).map((e) => e.k), [1, 2, 3]);
+});
+
+test('announcements give the split and the average pace', () => {
+  const MI = 1609.344;
+  // 8:00 first mile, then 9:00 per mile.
+  const tl = [];
+  for (let t = 0; t <= 1600; t++) tl.push({ t, d: t <= 480 ? (t / 480) * MI : MI + ((t - 480) / 540) * MI });
+  assert.equal(Math.round(crossingTime(tl, 2 * MI)), 1020);
+  assert.equal(
+    announcement([{ kind: 'split', k: 2, at: 2 * MI }], tl, 'mi'),
+    'Mile 2. Split 9 minutes. Average pace 8 minutes 30 seconds per mile.',
+  );
+  assert.equal(
+    announcement([{ kind: 'half', at: 1.5 * MI }], tl, 'mi'),
+    'Halfway. 1.5 miles in 12 minutes 30 seconds. Average pace 8 minutes 20 seconds per mile.',
+  );
+  assert.equal(
+    announcement([{ kind: 'split', k: 1, at: MI }, { kind: 'half', at: MI }], tl, 'mi'),
+    'Mile 1. Split 8 minutes. Halfway. Average pace 8 minutes per mile.',
+  );
+  assert.equal(spokenDuration(3725), '1 hour 2 minutes 5 seconds');
+  assert.equal(spokenDistance(1000, 'km'), '1 kilometer');
+});
+
+test('stretches of one run count and are left out together', () => {
+  const pri = prior(1.75);
+  const a = span('run', 165, 0.95, 400);
+  const b = span('run', 172, 1.1, 400);
+  const c = span('run', 168, 1.0, 900);
+  const model = fit(
+    [
+      { ...obs(a.m, a.d, 0.02), group: 'out' },
+      { ...obs(b.m, b.d, 0.02), group: 'out' },
+      obs(c.m, c.d),
+    ],
+    pri,
+  );
+  assert.equal(model.count, 2);
+  const ids = Object.keys(model.error.byId);
+  assert.equal(ids.length, 3);
+  assert.equal(model.error.byId[ids[0]], model.error.byId[ids[1]]);
 });

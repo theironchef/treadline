@@ -98,29 +98,35 @@ export function speed(beta, gait, cadence, intensity) {
   return (cadence / 60) * stepLength(beta, gait, cadence, intensity);
 }
 
-// observations: [{ id, t, moments, distance, sigma, include }]
-// Returns the fitted coefficients plus a leave-one-out error estimate.
+// observations: [{ id, group?, t, moments, distance, sigma, include }]
+// Observations sharing a group (the stretches of one outdoor run) count as
+// one measurement. Returns the fitted coefficients plus a leave-one-out error
+// estimate.
 export function fit(observations, pri, now = Date.now()) {
   const used = observations
     .filter((o) => o.include !== false && o.distance > 0)
-    .map((o) => ({ ...o, f: features(o.moments) }));
+    .map((o) => ({ ...o, group: o.group ?? o.id, f: features(o.moments) }));
   const beta = solveMap(used, pri, now);
-  return { beta, count: used.length, error: looError(used, pri, now) };
+  const groups = new Set(used.map((o) => o.group));
+  return { beta, count: groups.size, error: looError(used, groups, pri, now) };
 }
 
-// How far off each observation would have been had the model been fitted
-// without it. Honest with small data sets, where in-sample residuals flatter.
-function looError(used, pri, now) {
-  if (used.length < 2) return null;
+// How far off each measurement would have been had the model been fitted
+// without it (a whole group at a time, since stretches of the same run share
+// conditions). Honest with small data sets, where in-sample residuals
+// flatter. byId gives each observation its group's error.
+function looError(used, groups, pri, now) {
+  if (groups.size < 2) return null;
   const byId = {};
   let ss = 0;
-  for (const o of used) {
-    const b = solveMap(used.filter((x) => x !== o), pri, now);
-    const e = predict(b, o.f) / o.distance - 1;
-    byId[o.id] = e;
+  for (const g of groups) {
+    const out = used.filter((x) => x.group === g);
+    const b = solveMap(used.filter((x) => x.group !== g), pri, now);
+    const e = out.reduce((s, o) => s + predict(b, o.f), 0) / out.reduce((s, o) => s + o.distance, 0) - 1;
+    for (const o of out) byId[o.id] = e;
     ss += e * e;
   }
-  return { rms: Math.sqrt(ss / used.length), byId };
+  return { rms: Math.sqrt(ss / groups.size), byId };
 }
 
 function weight(o, now) {

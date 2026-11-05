@@ -91,3 +91,46 @@ test('two whole runs with treadmill distances calibrate a third', async () => {
   console.log(`third run calibrated error ${(after * 100).toFixed(1)}%`);
   assert.ok(Math.abs(after) < 0.03, `calibrated error ${(after * 100).toFixed(2)}%`);
 });
+
+test('an outdoor run with GPS calibrates a later treadmill run', async () => {
+  const { SimGps, GpsTrack } = await import('../js/gps.js');
+  const { Chunker, usableChunk } = await import('../js/run.js');
+  const pri = prior(1.75);
+  const program = [
+    [240, 3.4],
+    [600, 5.6],
+    [480, 6.6],
+    [360, 7.6],
+    [300, 6.0],
+  ];
+  const sim = new SimLink(1, program);
+  const gps = new SimGps(sim);
+  const track = new GpsTrack();
+  gps.addEventListener('fix', (e) => track.add(e.detail));
+  gps.start();
+  const chunker = new Chunker();
+  await sim.control(CMD.START);
+  for (let t = 0; t < 1980; t++) {
+    sim._tick();
+    chunker.update(track.snapshot(), await sim.readSums());
+  }
+  const chunks = chunker.finish(track.snapshot(), await sim.readSums());
+  const gpsErr = track.distance / sim.treadmillMeters - 1;
+  console.log(`GPS distance error ${(gpsErr * 100).toFixed(1)}%, ${chunks.length} chunks`);
+  assert.ok(Math.abs(gpsErr) < 0.02, `GPS error ${(gpsErr * 100).toFixed(2)}%`);
+  assert.ok(chunks.length >= 6 && chunks.every(usableChunk));
+
+  const obs = chunks.map((c, k) => ({ id: String(k), t: Date.now(), moments: c.moments, distance: c.distance, sigma: 0.02 }));
+  const model = fit(obs, pri);
+  const treadmill = await simulate([
+    [240, 3.8],
+    [300, 6.0],
+    [120, 8.0],
+    [300, 6.2],
+  ]);
+  const before = relErr(pri.mean, treadmill.sums, treadmill.truth);
+  const after = relErr(model.beta, treadmill.sums, treadmill.truth);
+  console.log(`treadmill uncalibrated ${(before * 100).toFixed(1)}%, GPS-calibrated ${(after * 100).toFixed(1)}%`);
+  assert.ok(Math.abs(after) < 0.025, `calibrated error ${(after * 100).toFixed(2)}%`);
+  assert.ok(Math.abs(after) < Math.abs(before));
+});
