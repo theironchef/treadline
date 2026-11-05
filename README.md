@@ -15,7 +15,13 @@ records alongside, so every outdoor run also calibrates your next indoor run.
    Every second, the app takes the last 8 seconds of motion, finds the
    strongest repeating rhythm (autocorrelation), and turns it into a cadence
    in steps per minute. It also measures how hard you're moving (the
-   "intensity", in g).
+   "intensity", in g). Both use only the size of the acceleration, so which
+   way the phone faces doesn't matter.
+   **Where it rides** is detected from two rhythm ratios. Motion once per
+   stride against once per step separates a limb (thigh, arm) from the waist.
+   How differently alternate steps land picks out a front pocket, whose leg
+   lands every other step. The thresholds come from how each spot moves
+   (simulated in `links.js`, `carrySample`), not from recordings.
 2. **Distance.** Step length is modeled separately for walking and running:
 
    ```
@@ -62,9 +68,12 @@ measurement keeps outdoor calibration honest.
 - **The motion sensor starts on its own** on Android. An iPhone needs one
   tap on **Enable motion sensor** (or Start) to allow it; the button only
   shows when no motion data is arriving.
-- **Carry the phone on your body:** front pocket, armband or waistband. On the
-  treadmill console it feels belt vibration, not your steps. Pick the
-  placement on the Calibrate tab; each one is calibrated separately.
+- **Carry the phone on your body:** front pocket, armband or waistband, facing
+  any way. On the treadmill console it feels belt vibration, not your steps.
+  The app works out which of the three it's in during the first minute of a
+  run, and each spot keeps its own calibration. The finish screen shows what
+  it detected; change it there if it's wrong. (Calibrate → Phone placement
+  can fix it to one spot instead.)
 - **Keep the app open with the screen on.** Browsers stop sending motion and GPS data
   to pages in the background. The app keeps the screen awake during a run,
   and **Lock screen** stops pocket taps (hold to unlock). Any time with no
@@ -77,8 +86,7 @@ measurement keeps outdoor calibration honest.
     or laps × the track length. It's optional; leave it blank if nothing
     measured the run. A run that's more than 20% off is assumed bad (rails,
     phone moved) and left out unless you tick it back in.
-  - *Outdoors:* nothing to type. Carry the phone the same way you do
-    indoors, because each placement is calibrated separately.
+  - *Outdoors:* nothing to type.
 - **Club:** the Club tab has a weekly leaderboard with friends and the club's
   combined distance. See [Leaderboard](#leaderboard).
 - **Back up** with *Export data* on the Calibrate tab. Your runs and
@@ -137,7 +145,8 @@ python -m http.server 5174
 ```
 
 Open <http://localhost:5174/?sim=20> for a simulated runner at 20× speed
-(3 min walk, then 6, 7 and 6.5 mph). Outdoor mode gets simulated GPS on a
+(3 min walk, then 6, 7 and 6.5 mph), phone in a front pocket; add
+`&carry=armband` or `&carry=waist` to move it. Outdoor mode gets simulated GPS on a
 loop. Simulator data is kept apart from real calibration. In the simulator,
 `treadline.link._tick()` in the console advances it one second, which is
 handy when the tab is in the background and its timers are throttled.
@@ -184,6 +193,7 @@ twice: the first launch fetches the new version, the second shows it.
 | --- | --- |
 | `web/js/sensor.js` | Cadence estimator and per-run accumulator |
 | `web/js/model.js` | Step-length model and calibration fit |
+| `web/js/placement.js` | Which spot the phone rides in, from how it moves |
 | `web/js/links.js` | Phone accelerometer source, and the simulator |
 | `web/js/gps.js` | GPS distance filter, phone and simulated GPS |
 | `web/js/run.js` | Live distance, splits, GPS calibration stretches, voice updates |

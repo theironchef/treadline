@@ -18,18 +18,25 @@ const MIN_LAG = Math.round(0.25 * FS);
 const MIN_STRIDE_LAG = Math.round(0.5 * FS);
 const MAX_LAG = Math.round(1.6 * FS);
 const STILL_G = 0.04;
+// Where-on-the-body features need a clean rhythm to mean anything.
+const CARRY_QUALITY = 0.4;
 
 export class CadenceEstimator {
   #t = [];
   #mag = [];
+  #axes = [[], [], []]; // x, y, z, for where-on-the-body features
   #steps = []; // [t, cumulative count] from a hardware step counter
 
   addAccel(t, x, y, z) {
     this.#t.push(t);
     this.#mag.push(Math.hypot(x, y, z));
+    this.#axes[0].push(x);
+    this.#axes[1].push(y);
+    this.#axes[2].push(z);
     while (this.#t.length && this.#t[0] < t - WINDOW_S - 1) {
       this.#t.shift();
       this.#mag.shift();
+      for (const a of this.#axes) a.shift();
     }
   }
 
@@ -38,8 +45,32 @@ export class CadenceEstimator {
     while (this.#steps.length && this.#steps[0][0] < t - 15) this.#steps.shift();
   }
 
-  // { cadence (spm), intensity (g), quality (0–1), source }
+  // { cadence (spm), intensity (g), quality (0–1), source, carry }, where
+  // carry holds the where-on-the-body features when there's a clear rhythm.
   estimate(now) {
+    const est = this.#cadence(now);
+    if (est.source === 'accel' && est.cadence > 0 && est.quality >= CARRY_QUALITY) {
+      est.carry = this.#carry(now, est.cadence);
+    }
+    return est;
+  }
+
+  // Two rhythm ratios, both indifferent to which way the phone faces (see
+  // placement.js). With f the step frequency and f/2 the stride frequency:
+  //   limb: motion of the whole 3-axis vector at f/2 against at f
+  //   asym: the same for the size of the acceleration alone
+  #carry(now, cadence) {
+    const n = this.#t.length;
+    const end = this.#t[n - 1];
+    const start = Math.max(this.#t[0], end - WINDOW_S);
+    const step = cadence / 60;
+    const axes = this.#axes.map((a) => resample(this.#t, a, start, end));
+    const mag = resample(this.#t, this.#mag, start, end);
+    const vec = (f) => Math.hypot(...axes.map((a) => amplitude(a, f)));
+    return { limb: vec(step / 2) / vec(step), asym: amplitude(mag, step / 2) / amplitude(mag, step) };
+  }
+
+  #cadence(now) {
     const none = { cadence: 0, intensity: 0, quality: 0, source: 'none' };
     const n = this.#t.length;
     if (n < 2 || now - this.#t[n - 1] > 2) return none;
@@ -128,6 +159,31 @@ function autocorr(s, maxLag) {
     r[L] = xx > 0 && yy > 0 ? xy / Math.sqrt(xx * yy) : 0;
   }
   return r;
+}
+
+// Size of the component of s at frequency f (Hz): a single-frequency Fourier
+// coefficient, through a Hann window so the strong step rhythm doesn't leak
+// into the stride rhythm next to it. The best of f ± 3% allows for cadence
+// drifting a little within the window. Only ratios of these are used, so the
+// scale doesn't matter.
+function amplitude(s, f) {
+  const n = s.length;
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += s[i];
+  mean /= n;
+  let best = 0;
+  for (const k of [0.97, 1, 1.03]) {
+    const w = (2 * Math.PI * f * k) / FS;
+    let re = 0;
+    let im = 0;
+    for (let i = 0; i < n; i++) {
+      const v = (s[i] - mean) * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1)));
+      re += v * Math.cos(w * i);
+      im -= v * Math.sin(w * i);
+    }
+    best = Math.max(best, Math.hypot(re, im));
+  }
+  return best;
 }
 
 const isPeak = (r, L) => r[L] > r[L - 1] && r[L] >= r[L + 1];

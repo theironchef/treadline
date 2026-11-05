@@ -1,8 +1,9 @@
 import * as store from './store.js';
 import { fit, prior, predict, features, diffMoments, summarize, speed, REF, UNCALIBRATED_ERROR } from './model.js';
 import { RunSession, Chunker, rescale, splits, milestones, announcement, usableChunk } from './run.js';
-import { CMD } from './sensor.js';
+import { CMD, FLAG } from './sensor.js';
 import { PhoneLink, SimLink } from './links.js';
+import { PLACES, PLACE_NAMES, PlacementVote } from './placement.js';
 import { PhoneGps, SimGps, GpsTrack } from './gps.js';
 import * as club from './club.js';
 import { BUILD } from './version.js';
@@ -11,10 +12,10 @@ import { UNITS } from './format.js';
 
 const params = new URLSearchParams(location.search);
 // ?sim or ?sim=20 swaps the phone's accelerometer (and GPS) for a simulated
-// runner.
+// runner; &carry=armband or waist moves its phone off the default pocket.
 const SIM = params.has('sim') ? Number(params.get('sim')) || 1 : 0;
+const SIM_CARRY = PLACES.includes(params.get('carry')) ? params.get('carry') : 'pocket';
 
-const PLACEMENTS = { pocket: 'Front pocket', armband: 'Armband', waist: 'Waistband' };
 const MIN_SEGMENT_S = 60;
 // How long to wait for motion data before offering the Enable button.
 const SENSOR_GRACE_MS = 2000;
@@ -41,7 +42,10 @@ const S = {
   settings: {
     units: 'mi',
     heightM: 1.75,
-    placement: 'pocket',
+    // Where the phone rides: 'auto' to detect it each run, or a fixed spot.
+    // lastPlace is the spot the last run ended up with.
+    carry: 'auto',
+    lastPlace: 'pocket',
     voice: true,
     segmentSpeed: '',
     mode: 'indoor',
@@ -54,7 +58,8 @@ const S = {
   },
   runs: [],
   observations: [],
-  model: null,
+  models: {}, // fitted calibration, per carry spot (see calKey)
+  calView: null, // the spot the Calibrate tab is showing
   link: null,
   gps: null,
   live: null,
@@ -72,7 +77,12 @@ const S = {
 if (SIM) window.treadline = S;
 
 const $app = document.getElementById('app');
-const source = () => (SIM ? 'sim' : S.settings.placement);
+// Each carry spot is calibrated separately; the simulator keeps its own.
+const calKey = (place) => (SIM ? 'sim' : place);
+const modelFor = (place) => S.models[calKey(place)];
+// Where the phone is taken to be: the current run's spot, else the setting,
+// else the spot the last run ended up with.
+const currentPlace = () => S.active?.place ?? (S.settings.carry === 'auto' ? S.settings.lastPlace : S.settings.carry);
 const unit = () => UNITS[S.settings.units];
 const $ = (id) => document.getElementById(id);
 
@@ -89,6 +99,13 @@ async function boot() {
   Object.assign(S.settings, settings);
   // The previous version called indoor runs 'treadmill'.
   if (S.settings.mode !== 'outdoor') S.settings.mode = 'indoor';
+  // Before detection, the spot was a fixed setting. Its calibration carries
+  // over as the starting guess, and detection takes over.
+  if (settings?.placement) {
+    if (PLACES.includes(settings.placement)) S.settings.lastPlace = settings.placement;
+    delete S.settings.placement;
+    saveSettings();
+  }
   if (!S.settings.member) {
     S.settings.member = store.newId();
     saveSettings();
@@ -117,11 +134,14 @@ async function boot() {
 }
 
 function refit() {
-  const obs = S.observations
-    .filter((o) => o.source === source())
-    .map((o) => (o.kind === 'gps' ? { ...o, group: o.runId } : o));
-  S.model = fit(obs, prior(S.settings.heightM));
-  S.active?.rs.setBeta(S.model.beta);
+  S.models = {};
+  for (const key of SIM ? ['sim'] : PLACES) {
+    const obs = S.observations
+      .filter((o) => o.source === key)
+      .map((o) => (o.kind === 'gps' ? { ...o, group: o.runId } : o));
+    S.models[key] = fit(obs, prior(S.settings.heightM));
+  }
+  if (S.active) S.active.rs.setBeta(modelFor(S.active.place).beta);
 }
 
 function saveSettings() {
@@ -132,7 +152,7 @@ function saveSettings() {
 
 function link() {
   if (!S.link) {
-    S.link = SIM ? new SimLink(SIM) : new PhoneLink();
+    S.link = SIM ? new SimLink(SIM, undefined, SIM_CARRY) : new PhoneLink();
     S.link.addEventListener('live', (e) => onLive(e.detail));
     S.link.addEventListener('status', () => S.screen === 'home' && render());
   }
@@ -153,11 +173,29 @@ function onLive(p) {
   const a = S.active;
   if (a && p.sessionId === a.sessionId) {
     a.rs.onLive(p);
+    if (p.carry && p.flags & FLAG.ACTIVE) notePlace(a, p.carry);
     if (a.chunker) S.link.readSums().then((sums) => a.chunker.update(a.track.snapshot(), sums));
     announce(a);
   }
   if (S.screen === 'live') updateLive();
   else if (S.screen === 'home') updateCheck();
+}
+
+// Where the phone rides: a vote each second while moving with a clear
+// rhythm. The first clear winner switches the run to that spot's
+// calibration, early on while the distance so far is small. The finish
+// screen goes by the final count.
+function notePlace(a, carry) {
+  a.vote.add(carry);
+  if (a.placeSettled) return;
+  const won = a.vote.winner;
+  if (!won) return;
+  a.placeSettled = true;
+  if (won !== a.place) {
+    a.place = won;
+    a.source = calKey(won);
+    a.rs.setBeta(modelFor(won).beta);
+  }
 }
 
 // Whether to offer the Enable button: no motion data, and the grace period
@@ -228,14 +266,21 @@ async function startRun() {
   await l.control(CMD.START);
   const sums = await l.readSums();
   const track = outdoor ? new GpsTrack() : null;
-  const rs = new RunSession(S.model.beta, null, track);
+  // Until detection settles, the run uses the spot the last run ended with.
+  const place = currentPlace();
+  const placeAuto = S.settings.carry === 'auto';
+  const rs = new RunSession(modelFor(place).beta, null, track);
   rs.onSums(sums);
   const target = S.settings.targetM >= 0.05 * unit().meters ? S.settings.targetM : 0;
   S.active = {
     id: store.newId(),
     startedAt: Date.now(),
     sessionId: sums.sessionId,
-    source: source(),
+    source: calKey(place),
+    place,
+    placeAuto,
+    placeSettled: !placeAuto,
+    vote: new PlacementVote(),
     mode: outdoor ? 'outdoor' : 'indoor',
     target,
     track,
@@ -275,6 +320,9 @@ function runState(a, sums) {
     id: a.id,
     startedAt: a.startedAt,
     source: a.source,
+    place: a.place,
+    placeAuto: a.placeAuto,
+    votes: a.vote.toJSON(),
     mode: a.mode,
     target: a.target,
     sums,
@@ -307,21 +355,33 @@ async function finishRun() {
 }
 
 function openFinish(saved) {
-  const beta = S.model.beta;
-  const estimate = predict(beta, features(saved.sums.moments));
-  let outdoor = null;
-  if (saved.mode === 'outdoor') {
-    const chunks = new Chunker(saved.chunker).finish(saved.gps, saved.sums);
-    const good = chunks.filter(
+  // The run's spot: where the votes ended up, when detecting and clear;
+  // otherwise what the run used. Runs saved before detection only have a
+  // calibration key.
+  const used = saved.place ?? (PLACES.includes(saved.source) ? saved.source : S.settings.lastPlace);
+  const detected = saved.placeAuto ? (new PlacementVote(saved.votes).winner ?? used) : null;
+  const chunks = saved.mode === 'outdoor' ? new Chunker(saved.chunker).finish(saved.gps, saved.sums) : null;
+  S.finish = { ...saved, place: detected ?? used, detected, chunks, simTruth: S.link?.treadmillMeters };
+  scoreFinish(S.finish);
+  store.setKv('activeRun', saved);
+  go('finish');
+}
+
+// What on the finish screen depends on the spot's calibration; run again if
+// the spot is changed there.
+function scoreFinish(f) {
+  const beta = modelFor(f.place).beta;
+  f.source = calKey(f.place);
+  f.estimate = predict(beta, features(f.sums.moments));
+  f.outdoor = null;
+  if (f.mode === 'outdoor') {
+    const good = f.chunks.filter(
       (c) => usableChunk(c) && Math.abs(predict(beta, features(c.moments)) / c.distance - 1) <= MAX_GPS_ERR,
     );
     // Without a GPS fix there's nothing better than the accelerometer.
-    const gpsOk = saved.gps.fixes > 1 && saved.gps.distance > 0;
-    outdoor = { good, gpsOk, distance: gpsOk ? saved.gps.distance : estimate };
+    const gpsOk = f.gps.fixes > 1 && f.gps.distance > 0;
+    f.outdoor = { good, gpsOk, distance: gpsOk ? f.gps.distance : f.estimate };
   }
-  S.finish = { ...saved, estimate, outdoor, simTruth: S.link?.treadmillMeters };
-  store.setKv('activeRun', saved);
-  go('finish');
 }
 
 async function saveRun() {
@@ -335,6 +395,8 @@ async function saveRun() {
     id: f.id,
     startedAt: f.startedAt,
     source: f.source,
+    place: f.place,
+    placeDetected: f.place === f.detected,
     mode: o ? 'outdoor' : 'indoor',
     target: f.target ?? 0,
     seconds: f.sums.elapsedMs / 1000,
@@ -368,7 +430,17 @@ async function saveRun() {
     await store.put('observations', x);
     S.observations.push(x);
   }
-  if (obs.length) refit();
+  // Calibration segments saved mid-run go with the spot the run ended up with.
+  const moved = S.observations.filter((x) => x.runId === f.id && x.kind === 'segment' && x.source !== f.source);
+  for (const x of moved) {
+    x.source = f.source;
+    await store.put('observations', x);
+  }
+  if (obs.length || moved.length) refit();
+  if (!SIM) {
+    S.settings.lastPlace = f.place;
+    saveSettings();
+  }
   if (S.settings.clubShare) sendToClub([{ type: 'run', run: clubRun(run) }]);
   await store.deleteKv('activeRun');
   S.finish = null;
@@ -784,11 +856,22 @@ function nav(active) {
   return `<nav class="tabs">${tab('home', 'Run')}${tab('club', 'Club')}${tab('calibrate', 'Calibrate')}</nav>`;
 }
 
-function calibrationLine() {
-  const m = S.model;
-  if (!m.count) return `Not calibrated · estimates may be off ±${Math.round(UNCALIBRATED_ERROR * 100)}%`;
+function calibrationLine(place = currentPlace()) {
+  const m = modelFor(place);
+  const spot = SIM ? '' : `${PLACE_NAMES[place]}: `;
+  if (!m.count) return `${spot}not calibrated · estimates may be off ±${Math.round(UNCALIBRATED_ERROR * 100)}%`;
   const err = m.error ? ` · typical error ±${(m.error.rms * 100).toFixed(1)}%` : '';
-  return `Calibrated from ${m.count} ${m.count === 1 ? 'measurement' : 'measurements'}${err}`;
+  return `${spot}calibrated from ${m.count} ${m.count === 1 ? 'measurement' : 'measurements'}${err}`;
+}
+
+// The run's spot on the finish screen, detected and changeable. Changing it
+// re-scores the run with that spot's calibration.
+function placeField() {
+  const f = S.finish;
+  const options = PLACES.map(
+    (p) => `<option value="${p}" ${p === f.place ? 'selected' : ''}>${PLACE_NAMES[p]}${p === f.detected ? ' (detected)' : ''}</option>`,
+  ).join('');
+  return `<label class="field">Phone was in<select id="finishPlace">${options}</select></label>`;
 }
 
 function home() {
@@ -830,7 +913,9 @@ function home() {
     </section>
     <section class="card sensor">
       <div class="sensor-head">
-        <span class="label">Steps · ${SIM ? 'Simulated runner' : PLACEMENTS[S.settings.placement]}</span>
+        <span class="label">Steps · ${
+          SIM ? `Simulated runner, ${PLACE_NAMES[SIM_CARRY].toLowerCase()}` : S.settings.carry === 'auto' ? 'pocket, armband or waistband' : PLACE_NAMES[S.settings.carry]
+        }</span>
         <span id="checkSig" class="sig"></span>
       </div>
       <div class="check"><b id="checkCad">–</b><span>steps / min</span></div>
@@ -937,7 +1022,7 @@ function live() {
   return `
     <section class="live">
       <header class="live-top">
-        <span class="sigs">${a?.track ? '<span id="gpsSig" class="sig"></span>' : ''}<span id="sig" class="sig"></span></span>
+        <span class="sigs">${a?.track ? '<span id="gpsSig" class="sig"></span>' : ''}<span id="sig" class="sig"></span><span id="placeSig" class="sig idle"></span></span>
         <button class="btn small ghost" data-act="lock">Lock screen</button>
       </header>
       <div class="hero"><b id="dist">0.00</b><span>${u.label}</span></div>
@@ -1014,6 +1099,7 @@ function updateLive() {
   const sig = signal(p);
   $('sig').className = `sig ${a.paused ? 'idle' : sig.cls}`;
   $('sig').textContent = a.paused ? 'Paused' : sig.text;
+  $('placeSig').textContent = a.placeSettled ? PLACE_NAMES[a.place] : 'Finding where the phone is…';
   if ($('gpsSig')) {
     const g = gpsSignal();
     $('gpsSig').className = `sig ${g.cls}`;
@@ -1074,9 +1160,10 @@ function finishOutdoor() {
     ${gap > 0 ? `<p class="warn">${fmt.clock(gap)} of this run had no step data, so those stretches are left out of calibration.</p>` : ''}
     <section class="card">
       <h3>Accelerometer calibration</h3>
+      ${placeField()}
       ${calibration}
       ${sim}
-      <label class="check-row"><input id="useCal" type="checkbox" ${o.good.length ? 'checked' : 'disabled'}> Use this run to calibrate</label>
+      <label class="check-row"><input id="useCal" type="checkbox" ${o.good.length && f.useCal !== false ? 'checked' : ''} ${o.good.length ? '' : 'disabled'}> Use this run to calibrate</label>
     </section>
     <div class="row end">
       <button class="btn ghost" data-act="discard">Discard</button>
@@ -1108,12 +1195,13 @@ function finishIndoor() {
     </section>
     ${gap > 0 ? `<p class="warn">${fmt.clock(gap)} of this run had no sensor data, so the estimate is short. It is left out of calibration unless you tick the box.</p>` : ''}
     <section class="card">
+      ${placeField()}
       <label class="field">Treadmill or track distance (optional)
-        <span class="input-unit"><input id="measured" type="number" inputmode="decimal" step="0.01" min="0" placeholder="${fmt.distance(f.estimate, units)}"><span>${u.label}</span></span>
+        <span class="input-unit"><input id="measured" type="number" inputmode="decimal" step="0.01" min="0" placeholder="${fmt.distance(f.estimate, units)}" value="${fmt.escape(f.measuredText ?? '')}"><span>${u.label}</span></span>
       </label>
       ${hint}
       <p id="compare" class="hint">${COMPARE_HINT}</p>
-      <label class="check-row"><input id="useCal" type="checkbox" ${gap > 0 ? '' : 'checked'}> Use this run to calibrate</label>
+      <label class="check-row"><input id="useCal" type="checkbox" ${(f.useCal ?? gap === 0) ? 'checked' : ''}> Use this run to calibrate</label>
     </section>
     <div class="row end">
       <button class="btn ghost" data-act="discard">Discard</button>
@@ -1170,6 +1258,7 @@ function runDetail() {
         <div><b>${Math.round(r.cadence)}</b><span>Cadence</span></div>
       </div>
       ${compare}
+      ${r.place ? `<p class="hint">Phone: ${PLACE_NAMES[r.place].toLowerCase()}${r.placeDetected ? ' (detected)' : ''}.</p>` : ''}
     </section>
     <section class="card"><h3>Speed (${u.speed})</h3>${speedChart(r.timeline)}</section>
     ${rows ? `<section class="card"><h3>Splits</h3><table class="splits"><thead><tr><th>${u.label}</th><th>Pace</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table></section>` : ''}
@@ -1204,8 +1293,11 @@ function speedChart(tl) {
 
 function calibrate() {
   const u = unit();
-  const m = S.model;
-  const obs = S.observations.filter((o) => o.source === source()).sort((a, b) => b.t - a.t);
+  // Each spot has its own calibration; show the one in use unless another
+  // was picked.
+  const view = S.calView ?? currentPlace();
+  const m = modelFor(view);
+  const obs = S.observations.filter((o) => o.source === calKey(view)).sort((a, b) => b.t - a.t);
   // An outdoor run's GPS stretches are listed (and switched on or off) as one.
   const groups = [];
   const byRun = new Map();
@@ -1251,22 +1343,19 @@ function calibrate() {
       ${
         SIM
           ? '<p class="hint">Simulator calibration is kept separate from your real runs.</p>'
-          : `<label class="field">Phone placement
-        <select id="placement">${Object.entries(PLACEMENTS)
-          .map(([k, v]) => `<option value="${k}" ${k === S.settings.placement ? 'selected' : ''}>${v}</option>`)
-          .join('')}</select>
-      </label>
-      <p class="hint">Each placement learns separately, so carry the phone the same way each run.</p>`
+          : `<label class="field">Showing the calibration for
+        <select id="calView">${PLACES.map((p) => `<option value="${p}" ${p === view ? 'selected' : ''}>${PLACE_NAMES[p]}</option>`).join('')}</select>
+      </label>`
       }
-      <p class="status">${calibrationLine()}</p>
-      ${calChart(obs)}
+      <p class="status">${calibrationLine(view)}</p>
+      ${calChart(obs, m)}
     </section>
     <section class="card">
       <h3>How to calibrate</h3>
       <ol class="steps">
         <li><b>Fastest, on a treadmill:</b> during an indoor run, tap <i>Calibrate at this speed</i>, type the treadmill speed and hold it for 1–2 minutes. Do this at an easy, a moderate and a fast speed, plus a walk.</li>
         <li><b>Every indoor run:</b> when you finish, type the distance the treadmill shows, or laps × the track length. Each run makes the next one more accurate.</li>
-        <li><b>Outdoors:</b> run in Outdoor mode with the phone carried the same way. GPS measures the distance, and every steady half mile or so calibrates the accelerometer automatically. Treadmill strides can differ a little from road strides, so an indoor measurement now and then keeps it honest.</li>
+        <li><b>Outdoors:</b> run in Outdoor mode. GPS measures the distance, and every steady half mile or so calibrates the accelerometer automatically. Treadmill strides can differ a little from road strides, so an indoor measurement now and then keeps it honest.</li>
       </ol>
     </section>
     <h2>Measurements</h2>
@@ -1278,6 +1367,16 @@ function calibrate() {
       </label>
       <label class="field">Height ${height}</label>
       <p class="hint">Height sets the starting guess before any calibration.</p>
+      ${
+        SIM
+          ? ''
+          : `<label class="field">Phone placement
+        <select id="carry"><option value="auto" ${S.settings.carry === 'auto' ? 'selected' : ''}>Detect it each run</option>${PLACES.map(
+          (p) => `<option value="${p}" ${p === S.settings.carry ? 'selected' : ''}>Always ${PLACE_NAMES[p].toLowerCase()}</option>`,
+        ).join('')}</select>
+      </label>
+      <p class="hint">Detection tells a front pocket, an armband and a waistband apart by how the phone moves. Which way the phone faces doesn't matter. Each spot keeps its own calibration.</p>`
+      }
       <label class="check-row"><input id="voice" type="checkbox" ${S.settings.voice ? 'checked' : ''}> Voice updates each ${u.word} and at halfway</label>
       <div class="row">
         <button class="btn small ghost" data-act="export">Export data</button>
@@ -1290,7 +1389,7 @@ function calibrate() {
 
 // Speed vs cadence: the fitted model, the uncalibrated prior, and each
 // measurement's average.
-function calChart(obs) {
+function calChart(obs, model) {
   const f = unit().speedFactor;
   const pri = prior(S.settings.heightM).mean;
   const runObs = obs.filter((o) => o.include !== false && o.moments.run.n > 0);
@@ -1322,8 +1421,8 @@ function calChart(obs) {
     ${grid}
     <polyline points="${curve(pri, 'walk', 100, 138, REF.walk.i0)}" class="series prior"/>
     <polyline points="${curve(pri, 'run', 140, 200, iRun)}" class="series prior"/>
-    <polyline points="${curve(S.model.beta, 'walk', 100, 138, REF.walk.i0)}" class="series"/>
-    <polyline points="${curve(S.model.beta, 'run', 140, 200, iRun)}" class="series"/>
+    <polyline points="${curve(model.beta, 'walk', 100, 138, REF.walk.i0)}" class="series"/>
+    <polyline points="${curve(model.beta, 'run', 140, 200, iRun)}" class="series"/>
     ${dots}
     <text x="0" y="166" class="axis">${cMin} spm</text><text x="300" y="166" class="axis" text-anchor="end">${cMax} spm</text>
   </svg>
@@ -1466,11 +1565,22 @@ $app.addEventListener('change', async (e) => {
     }
     refit();
     render();
-  } else if (el.id === 'placement') {
-    S.settings.placement = el.value;
+  } else if (el.id === 'carry') {
+    S.settings.carry = el.value;
+    S.calView = null;
     saveSettings();
-    refit();
     render();
+  } else if (el.id === 'calView') {
+    S.calView = el.value;
+    render();
+  } else if (el.id === 'finishPlace') {
+    // Re-score with that spot's calibration, keeping what's been typed.
+    S.finish.place = el.value;
+    S.finish.measuredText = $('measured')?.value ?? '';
+    S.finish.useCal = $('useCal')?.checked;
+    scoreFinish(S.finish);
+    render();
+    if (S.finish.measuredText) updateCompare();
   } else if (el.id === 'units') {
     S.settings.units = el.value;
     S.settings.segmentSpeed = '';

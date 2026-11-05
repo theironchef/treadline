@@ -2,7 +2,7 @@
 // background. When a refresh turns up a changed file, a new version has been
 // deployed: fetch the whole shell again, then tell open pages so they can
 // offer a reload. Bump VERSION when the file list changes.
-const VERSION = 'treadline-v4';
+const VERSION = 'treadline-v5';
 const FILES = [
   './',
   'index.html',
@@ -17,6 +17,7 @@ const FILES = [
   'js/gps.js',
   'js/links.js',
   'js/model.js',
+  'js/placement.js',
   'js/run.js',
   'js/sensor.js',
   'js/store.js',

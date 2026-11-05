@@ -3,7 +3,8 @@ import { CadenceEstimator, Session, CMD, STATE, FLAG } from './sensor.js';
 // Sensor links. Each runs the estimator once a second and emits:
 //   'status' — 'disconnected' | 'connected'
 //   'live'   — { cadence, intensity, quality, flags, gait, elapsedMs, gapMs,
-//                steps, sessionId, hr }
+//                steps, sessionId, hr, carry }, carry being the
+//                where-on-the-body features (or null)
 // and answers readSums() with the session's cumulative moments.
 
 // A tick arriving later than this means the page was frozen (screen off or
@@ -73,6 +74,7 @@ class LocalLink extends EventTarget {
       gapMs: s.gapMs,
       steps: Math.floor(s.steps),
       sessionId: s.sessionId,
+      carry: est.carry ?? null,
     };
     this.dispatchEvent(new CustomEvent('live', { detail }));
   }
@@ -158,10 +160,12 @@ export class SimLink extends LocalLink {
   #phase = 0;
   #drift = 0;
 
-  constructor(speedup = 1, program = PROGRAM) {
+  // place: where the simulated phone rides, 'pocket', 'armband' or 'waist'.
+  constructor(speedup = 1, program = PROGRAM, place = 'pocket') {
     super();
     this.#speedup = speedup;
     this.#program = program;
+    this.place = place;
   }
 
   static supported() {
@@ -189,7 +193,8 @@ export class SimLink extends LocalLink {
     const c = cadence > 0 ? cadence + this.#drift : 0;
     for (let k = 1; k <= 50; k++) {
       this.#phase += c / 60 / 50;
-      this.estimator.addAccel(this.#t + k / 50, 0, 0, synth(this.#phase, amp));
+      const a = carrySample(this.#phase, amp, this.place);
+      this.estimator.addAccel(this.#t + k / 50, a.x, a.y, a.z);
     }
     this.#t += 1;
     if (active) this.treadmillMeters += mph * MPH;
@@ -221,6 +226,37 @@ export function synth(phase, amp) {
   const pulse = Math.exp(-((within - 0.1) ** 2) / 0.004) * (near ? 1 : 0.7);
   const swing = Math.sin(Math.PI * phase);
   return G + amp * (2.2 * pulse + 0.6 * swing) + (0.05 + 0.25 * amp) * gauss();
+}
+
+// The same runner as the phone feels it on each spot, in the phone's own
+// axes (m/s²). The body's up, forward and side accelerations are tilted by
+// the limb's swing: a thigh rocks about ±20° walking and ±35° running, an
+// upper arm about ±12–22°, the pelvis a few degrees. On the thigh the far
+// foot's strike arrives at about 40% of the near one's; the arm gets both
+// softened. Everyone sways side to side once per stride. Numbers scale with
+// `amp`, about 2 walking and 6–8 running.
+const CARRY = {
+  pocket: { tilt: [15, 3], far: 0.4, impact: 1, swing: 0.6 },
+  armband: { tilt: [8, 2], far: 0.9, impact: 0.45, swing: 0.45 },
+  waist: { tilt: [2, 0.2], far: 0.9, impact: 0.9, swing: 0.08 },
+};
+const SWAY = 0.25;
+
+export function carrySample(phase, amp, place = 'pocket') {
+  const c = CARRY[place];
+  const near = Math.floor(phase) % 2 === 0;
+  const pulse = Math.exp(-(((phase % 1) - 0.1) ** 2) / 0.004) * (near ? 1 : c.far);
+  const stride = Math.PI * phase; // one cycle every two steps
+  const up = G + amp * (2.2 * c.impact * pulse + 0.3 * Math.cos(2 * Math.PI * phase));
+  const forward = c.swing * amp * Math.sin(stride + 0.5);
+  const side = SWAY * amp * Math.sin(stride);
+  const tilt = (((c.tilt[0] + c.tilt[1] * amp) * Math.PI) / 180) * Math.sin(stride);
+  const noise = 0.05 + 0.15 * amp;
+  return {
+    x: side + noise * gauss(),
+    y: up * Math.cos(tilt) + forward * Math.sin(tilt) + noise * gauss(),
+    z: -up * Math.sin(tilt) + forward * Math.cos(tilt) + noise * gauss(),
+  };
 }
 
 function gauss() {
