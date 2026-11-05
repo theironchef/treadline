@@ -77,10 +77,12 @@ node --test tests/*.test.mjs
 
 Motion sensors and installing as an app both need HTTPS (or `localhost`).
 
-**Option A — host it (recommended).** Any static HTTPS host works, for
-example GitHub Pages: push the `web/` folder to a repository, enable Pages,
-open the URL in Chrome on the phone, then *⋮ → Add to Home screen /
-Install app*.
+**Option A — the hosted copy (recommended).** Open
+<https://theironchef.github.io/treadline/> in Chrome on the phone, then
+*⋮ → Add to Home screen → Install*. Every push to `main` runs the tests and
+redeploys `web/` (without `tests/`) through
+`.github/workflows/pages.yml`. An installed copy picks up a deploy the
+second time it's opened.
 
 **Option B — over USB, no hosting.** With USB debugging on the phone and
 `adb` from the Android SDK platform-tools:
@@ -104,6 +106,7 @@ twice: the first launch fetches the new version, the second shows it.
 | `web/js/app.js` | Screens and run flow |
 | `web/js/store.js` | IndexedDB storage |
 | `web/sw.js` | Offline caching |
+| `.github/workflows/pages.yml` | Test and deploy to GitHub Pages |
 
 ## Pixel Watch (later)
 
