@@ -101,12 +101,27 @@ export class PhoneLink extends LocalLink {
     this.estimator.addAccel(e.timeStamp / 1000, a.x, a.y, a.z);
   };
 
+  // Starts listening without asking. Android sends motion data straight away;
+  // iOS sends nothing until pick() has asked, which needs a tap.
+  listen() {
+    window.removeEventListener('devicemotion', this.#onMotion);
+    window.addEventListener('devicemotion', this.#onMotion);
+    if (!this.connected) this._startTicking(1000);
+  }
+
+  // From a tap: ask for permission where the browser wants that, then listen.
   async pick() {
     if (typeof DeviceMotionEvent.requestPermission === 'function') {
-      if ((await DeviceMotionEvent.requestPermission()) !== 'granted') throw new Error('Motion access was denied');
+      if ((await DeviceMotionEvent.requestPermission()) !== 'granted') {
+        throw new Error('Motion access is blocked. Allow motion sensors for this site in the browser’s settings.');
+      }
     }
-    window.addEventListener('devicemotion', this.#onMotion);
-    this._startTicking(1000);
+    this.listen();
+  }
+
+  // Whether motion data is actually arriving.
+  get receiving() {
+    return performance.now() - this.lastSampleAt < 3000;
   }
 
   disconnect() {

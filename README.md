@@ -59,6 +59,9 @@ measurement keeps outdoor calibration honest.
   Indoors GPS stays off.
 - **Voice updates** at every mile (or km) give that mile's split and your
   average pace. You also hear one at halfway and when you reach the target.
+- **The motion sensor starts on its own** on Android. An iPhone needs one
+  tap on **Enable motion sensor** (or Start) to allow it; the button only
+  shows when no motion data is arriving.
 - **Carry the phone on your body:** front pocket, armband or waistband. On the
   treadmill console it feels belt vibration, not your steps. Pick the
   placement on the Calibrate tab; each one is calibrated separately.
@@ -157,9 +160,12 @@ shows an Install button when Chrome offers one. If the menu has no such
 option, the page is open inside another app's browser: choose *Open in
 Chrome* first. Every push to `main` runs the tests and redeploys `web/`
 (without `tests/`) through `.github/workflows/pages.yml`. An installed copy
-checks for a new version each time it starts. When it finds one, it
-downloads the whole thing in the background and shows a **Reload** bar. The
-bar never appears mid-run; it waits until the run is saved.
+checks for a new version when it starts and whenever it comes back to the
+foreground (at most every 15 minutes), since Android usually resumes an
+installed app rather than restarting it. When it finds one, it downloads the
+whole thing in the background and shows a **Reload** bar. The bar never
+appears mid-run; it waits until the run is saved. The Calibrate tab shows the
+version (the last commit that changed `web/`) and has **Check for updates**.
 
 **Option B — over USB, no hosting.** With USB debugging on the phone and
 `adb` from the Android SDK platform-tools:

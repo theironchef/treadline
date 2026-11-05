@@ -2,7 +2,7 @@
 // background. When a refresh turns up a changed file, a new version has been
 // deployed: fetch the whole shell again, then tell open pages so they can
 // offer a reload. Bump VERSION when the file list changes.
-const VERSION = 'treadline-v3';
+const VERSION = 'treadline-v4';
 const FILES = [
   './',
   'index.html',
@@ -20,6 +20,7 @@ const FILES = [
   'js/run.js',
   'js/sensor.js',
   'js/store.js',
+  'js/version.js',
 ];
 
 // no-cache: revalidate with the server instead of trusting the HTTP cache,
@@ -63,6 +64,23 @@ self.addEventListener('fetch', (e) => {
     }),
   );
 });
+
+// The page asks for a full check when it comes back to the foreground (an
+// installed app is usually resumed rather than restarted, so nothing else
+// would reach the server) and when you tap Check for updates.
+self.addEventListener('message', (e) => {
+  if (e.data?.type === 'check') e.waitUntil(check(e.source));
+});
+
+async function check(page) {
+  const cache = await caches.open(VERSION);
+  for (const f of FILES) {
+    const [old, res] = await Promise.all([cache.match(f), fetch(fresh(f)).catch(() => null)]);
+    if (!res?.ok) return page?.postMessage({ type: 'check-failed' });
+    if (!old || (await differs(old, res))) return refreshAll();
+  }
+  page?.postMessage({ type: 'up-to-date' });
+}
 
 let refreshing = null;
 

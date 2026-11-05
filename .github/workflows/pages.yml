@@ -23,13 +23,20 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history, to find the last commit that changed web/.
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node --test web/tests/*.test.mjs
+      # The version the app shows is the last commit that changed web/, so a
+      # README-only push doesn't look like an update.
       - run: |
           cp -r web _site
           rm -rf _site/tests
+          echo "export const BUILD = '$(git log -1 --format=%h -- web)';" > _site/js/version.js
+          cat _site/js/version.js
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:

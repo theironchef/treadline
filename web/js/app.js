@@ -5,6 +5,7 @@ import { CMD } from './sensor.js';
 import { PhoneLink, SimLink } from './links.js';
 import { PhoneGps, SimGps, GpsTrack } from './gps.js';
 import * as club from './club.js';
+import { BUILD } from './version.js';
 import * as fmt from './format.js';
 import { UNITS } from './format.js';
 
@@ -15,6 +16,8 @@ const SIM = params.has('sim') ? Number(params.get('sim')) || 1 : 0;
 
 const PLACEMENTS = { pocket: 'Front pocket', armband: 'Armband', waist: 'Waistband' };
 const MIN_SEGMENT_S = 60;
+// How long to wait for motion data before offering the Enable button.
+const SENSOR_GRACE_MS = 2000;
 // GPS stretches are noisier than a treadmill's readout, so they count for less.
 const GPS_SIGMA = 0.02;
 // A GPS stretch this far from the current model is assumed bad (a GPS jump,
@@ -97,9 +100,13 @@ async function boot() {
   render();
   store.persist();
   flushClub();
-  // Android grants motion data without a prompt, so start the sensor check
-  // right away; iOS needs a tap first.
-  if (SIM || typeof DeviceMotionEvent?.requestPermission !== 'function') enableSensor();
+  // Android sends motion data without asking, so listen straight away. Newer
+  // Chrome has the same permission call as iOS, but doesn't need it; the
+  // Enable button only appears if no data arrives (iOS, or access blocked).
+  if (SIM) enableSensor();
+  else if (PhoneLink.supported()) link().listen();
+  S.sensorGrace = performance.now() + SENSOR_GRACE_MS;
+  setTimeout(() => S.screen === 'home' && updateCheck(), SENSOR_GRACE_MS + 100);
   if ('serviceWorker' in navigator && !SIM) navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
@@ -147,8 +154,12 @@ function onLive(p) {
   else if (S.screen === 'home') updateCheck();
 }
 
+// Whether to offer the Enable button: no motion data, and the grace period
+// for it to start arriving is over.
+const sensorStuck = () => !SIM && !S.link?.receiving && performance.now() > (S.sensorGrace ?? 0);
+
 function signal(p) {
-  if (!p || !S.link?.connected) return { cls: 'off', text: 'Sensor off' };
+  if (!p || !S.link?.connected || S.link.receiving === false) return { cls: 'off', text: 'Sensor off' };
   if (p.cadence === 0 && p.intensity < 0.04) return { cls: 'idle', text: 'Still' };
   if (p.quality >= 0.5) return { cls: 'ok', text: 'Strong rhythm' };
   if (p.quality >= 0.3) return { cls: 'ok', text: 'Rhythm OK' };
@@ -203,7 +214,9 @@ async function startRun() {
     if (S.gps.status === 'denied') return toast(S.gps.message);
   }
   const l = link();
-  if (!l.connected) await enableSensor();
+  // This tap is the chance to ask for motion access if the browser wants
+  // that (iOS); on Android data is already flowing.
+  if (SIM ? !l.connected : !l.receiving) await enableSensor();
   if (!l.connected) return;
   if (outdoor && !S.gps.last) toast('No GPS fix yet. Distance starts counting once it locks on.');
   await l.control(CMD.START);
@@ -450,17 +463,44 @@ document.addEventListener('visibilitychange', () => {
 // The service worker refreshes the app in the background and says when a
 // new version is ready (see sw.js). A bar then offers a reload, but never
 // during a run or on the finish screen: it waits until the run is saved.
+//
+// An installed app is usually resumed rather than restarted, and a resumed
+// page asks the server for nothing, so the page also asks the worker for a
+// full check at startup and whenever it comes back to the foreground.
+const UPDATE_CHECK_MS = 15 * 60000;
 let updateReady = false;
+let lastCheck = 0;
+let checkAsked = false; // Check for updates was tapped, so answer either way
 
 if ('serviceWorker' in navigator && !SIM) {
   const hadWorker = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.addEventListener('message', (e) => {
-    if (e.data?.type === 'update-ready') showUpdateBar();
+    const type = e.data?.type;
+    if (type === 'update-ready') showUpdateBar();
+    else if (type === 'up-to-date' && checkAsked) toast(`You have the latest version (${BUILD}).`);
+    else if (type === 'check-failed' && checkAsked) toast('Couldn’t check for updates. Are you online?');
+    if (type) checkAsked = false;
   });
   // A new worker (after a change to the file list) takes over in place. The
   // very first install does too, and that isn't an update.
   navigator.serviceWorker.addEventListener('controllerchange', () => hadWorker && showUpdateBar());
   navigator.serviceWorker.startMessages?.();
+  navigator.serviceWorker.ready.then(() => setTimeout(checkForUpdate, 3000));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !S.active) checkForUpdate();
+  });
+}
+
+function checkForUpdate(asked = false) {
+  const worker = navigator.serviceWorker?.controller;
+  if (!worker) {
+    if (asked) toast('Reload the app once, then check again.');
+    return;
+  }
+  if (!asked && Date.now() - lastCheck < UPDATE_CHECK_MS) return;
+  lastCheck = Date.now();
+  checkAsked = asked === true;
+  worker.postMessage({ type: 'check' });
 }
 
 function showUpdateBar() {
@@ -796,7 +836,7 @@ function home() {
             ? 'GPS measures the distance. The accelerometer records too, and steady stretches calibrate it for indoor runs.'
             : 'Put the phone where it will ride during the run and walk around. The cadence here should match your steps.'
       }</p>
-      ${S.link?.connected ? '' : '<button class="btn small" data-act="enable">Enable motion sensor</button>'}
+      <button class="btn small" id="enableSensor" data-act="enable" ${sensorStuck() ? '' : 'hidden'}>Enable motion sensor</button>
     </section>
     <button class="btn start" data-act="start">Start ${outdoor ? 'outdoor' : 'indoor'} run</button>
     <button class="cal-line" data-act="go" data-to="calibrate">${calibrationLine()} →</button>
@@ -814,6 +854,7 @@ function updateCheck() {
     $('checkSig').className = `sig ${sig.cls}`;
     $('checkSig').textContent = sig.text;
   }
+  if ($('enableSensor')) $('enableSensor').hidden = !sensorStuck();
   if ($('gpsSig')) {
     const g = gpsSignal();
     $('gpsSig').className = `sig ${g.cls}`;
@@ -1236,6 +1277,7 @@ function calibrate() {
         <button class="btn small ghost" data-act="export">Export data</button>
         <label class="btn small ghost">Import<input id="import" type="file" accept="application/json" hidden></label>
       </div>
+      <p class="hint">Version ${BUILD} · <button class="link" data-act="checkUpdate">Check for updates</button></p>
     </section>
     ${nav('calibrate')}`;
 }
@@ -1354,6 +1396,7 @@ const actions = {
     render();
   },
   export: () => exportData(),
+  checkUpdate: () => checkForUpdate(true),
   install: () => install(),
   hideInstall: () => {
     S.settings.installHidden = true;
