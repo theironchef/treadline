@@ -219,6 +219,26 @@ b {
   padding: 6px;
 }
 
+/* install */
+
+.install {
+  border-color: var(--accent);
+}
+
+.install-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.install .x {
+  padding: 0 4px;
+}
+
+.install .btn {
+  margin-top: 12px;
+}
+
 /* run type + target wheel */
 
 .mode {

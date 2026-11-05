@@ -420,6 +420,64 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && S.active) wakeLock(true);
 });
 
+// ---------- install ----------
+
+// Chrome hands the page an install offer once the app qualifies. Keeping it
+// lets the start screen show an Install button instead of leaving people to
+// find it in the browser menu. Pages opened inside another app (a link
+// tapped in a chat app) never get one, so the card explains that too.
+let installOffer = null;
+let justInstalled = false;
+const installed = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installOffer = e;
+  refreshInstallCard();
+});
+
+window.addEventListener('appinstalled', () => {
+  installOffer = null;
+  justInstalled = true;
+  refreshInstallCard();
+});
+
+async function install() {
+  const offer = installOffer;
+  if (!offer) return;
+  // An offer can only be used once.
+  installOffer = null;
+  offer.prompt();
+  const { outcome } = await offer.userChoice;
+  if (outcome === 'accepted') justInstalled = true;
+  refreshInstallCard();
+}
+
+function installCard() {
+  if (SIM || installed() || S.settings.installHidden) return '<div id="install"></div>';
+  const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const how = justInstalled
+    ? '<p class="hint"><b>Installed.</b> Open Treadline from your home screen or app drawer.</p>'
+    : installOffer
+    ? '<button class="btn small" data-act="install">Install app</button>'
+    : ios
+      ? '<p class="hint">In Safari, tap <b>Share</b>, then <b>Add to Home Screen</b>.</p>'
+      : `<p class="hint">In Chrome, tap <b>⋮</b> (top right), then <b>Install app</b>, or <b>Add to home screen</b> and then <b>Install</b>.</p>
+        <p class="hint">No such option? The page is probably open inside another app. Tap <b>⋮</b> and choose <b>Open in Chrome</b> first.</p>`;
+  return `<section id="install" class="card install">
+      <div class="install-head"><b>Install Treadline</b><button class="x" data-act="hideInstall" aria-label="Hide">×</button></div>
+      <p class="hint">It gets a home screen icon, opens full screen and works offline.</p>
+      ${how}
+    </section>`;
+}
+
+// Swaps just the card, so an offer arriving mid-scroll doesn't reset the
+// target wheel.
+function refreshInstallCard() {
+  const el = $('install');
+  if (el) el.outerHTML = installCard();
+}
+
 // ---------- rendering ----------
 
 function go(screen, extra = {}) {
@@ -479,6 +537,7 @@ function home() {
   return `
     <header class="top"><h1>Treadline</h1>${SIM ? '<span class="pill">Simulator</span>' : ''}</header>
     ${unfinished}
+    ${installCard()}
     <div class="mode" role="radiogroup" aria-label="Where you're running">${modeBtn('indoor', 'Indoor')}${modeBtn('outdoor', 'Outdoor')}</div>
     <section class="card target">
       <div class="sensor-head"><span class="label">Target distance</span><span id="targetNote" class="label"></span></div>
@@ -1059,6 +1118,12 @@ const actions = {
     render();
   },
   export: () => exportData(),
+  install: () => install(),
+  hideInstall: () => {
+    S.settings.installHidden = true;
+    saveSettings();
+    refreshInstallCard();
+  },
 };
 
 $app.addEventListener('click', (e) => {
