@@ -22,7 +22,14 @@ const GPS_SIGMA = 0.02;
 const MAX_GPS_ERR = 0.25;
 const WHEEL_ITEM = 40;
 const MAX_TARGET = 50;
-const CLUB_SETUP_URL = 'https://github.com/theironchef/treadline#leaderboard';
+// The club everyone joins: a Google Sheet running leaderboard/Code.gs (see
+// README → Leaderboard). Built in so joining is just a name and a tap; the
+// trade-off is that anyone who reads this file could post runs to it.
+const CLUB_URL = 'https://script.google.com/macros/s/AKfycbwO95odoboU39sY4eSCQl4ero0OtO3UtPVw7SvytQiGc93JHVrH38z-DEs2bGOK32_8/exec';
+// The simulator joins the local stand-in instead, so simulated runs never
+// reach the real club.
+const DEV_CLUB_URL = 'http://localhost:5175/exec';
+const defaultClub = () => (SIM ? DEV_CLUB_URL : CLUB_URL);
 // How long the Club tab trusts the board it last fetched.
 const CLUB_STALE_MS = 60000;
 
@@ -438,6 +445,44 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && S.active) wakeLock(true);
 });
 
+// ---------- updates ----------
+
+// The service worker refreshes the app in the background and says when a
+// new version is ready (see sw.js). A bar then offers a reload, but never
+// during a run or on the finish screen: it waits until the run is saved.
+let updateReady = false;
+
+if ('serviceWorker' in navigator && !SIM) {
+  const hadWorker = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'update-ready') showUpdateBar();
+  });
+  // A new worker (after a change to the file list) takes over in place. The
+  // very first install does too, and that isn't an update.
+  navigator.serviceWorker.addEventListener('controllerchange', () => hadWorker && showUpdateBar());
+  navigator.serviceWorker.startMessages?.();
+}
+
+function showUpdateBar() {
+  updateReady = true;
+  refreshUpdateBar();
+}
+
+function refreshUpdateBar() {
+  if (!updateReady) return;
+  let bar = $('updateBar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'updateBar';
+    bar.className = 'update-bar';
+    bar.innerHTML = '<span>A new version of Run Club is ready.</span><button class="btn small">Reload</button>';
+    bar.querySelector('button').addEventListener('click', () => location.reload());
+    document.body.append(bar);
+  }
+  bar.hidden = !!S.active || S.screen === 'live' || S.screen === 'finish';
+  document.body.classList.toggle('has-update', !bar.hidden);
+}
+
 // ---------- install ----------
 
 // Chrome hands the page an install offer once the app qualifies. Keeping it
@@ -640,35 +685,28 @@ function clubScreen() {
     ${nav('club')}`;
 }
 
+// Joining the built-in club takes a name and a tap. An invite link to some
+// other club (#club=…) still works, for a second club or the local stand-in.
 function clubSetup() {
   const invite = S.clubInvite;
   const switching = invite && S.settings.clubUrl;
   return `
     <header class="top"><h1>Club</h1></header>
     <section class="card">
-      <h3>${invite ? 'You’re invited to a Run Club' : 'Join a club'}</h3>
+      <h3>${invite ? 'You’re invited to a club' : 'Join Run Club'}</h3>
       <p class="hint">${
         invite
           ? `Pick the name the leaderboard shows for you.${switching ? ' Joining moves you out of your current club.' : ''}`
-          : 'Open the invite link a friend sent you, or paste the club link here.'
+          : 'Your runs count toward the weekly leaderboard and the whole club’s distance. No account needed; just pick the name everyone sees.'
       }</p>
       <label class="field">Your name on the board
         <input id="clubName" type="text" maxlength="30" autocomplete="nickname" value="${fmt.escape(S.settings.name)}" placeholder="Name">
       </label>
-      ${invite ? '' : '<label class="field">Club link<input id="clubUrl" type="url" inputmode="url" placeholder="https://script.google.com/macros/s/…/exec"></label>'}
       <div class="row club-actions">
         <button class="btn" data-act="clubJoin">Join</button>
         ${invite ? '<button class="btn ghost" data-act="clubDecline">Not now</button>' : ''}
       </div>
     </section>
-    ${
-      invite
-        ? ''
-        : `<section class="card">
-      <h3>Start a club</h3>
-      <p class="hint">A club is a Google Sheet you own, set up once in about five minutes. Nobody else needs an account or a login. <a href="${CLUB_SETUP_URL}" target="_blank" rel="noopener">How to set one up</a></p>
-    </section>`
-    }
     ${nav('club')}`;
 }
 
@@ -691,6 +729,7 @@ function render() {
     updateCheck();
   }
   if (S.screen === 'club' && !S.club.loading && Date.now() - S.club.tried > CLUB_STALE_MS) loadBoard();
+  refreshUpdateBar();
 }
 
 function nav(active) {
@@ -761,6 +800,7 @@ function home() {
     </section>
     <button class="btn start" data-act="start">Start ${outdoor ? 'outdoor' : 'indoor'} run</button>
     <button class="cal-line" data-act="go" data-to="calibrate">${calibrationLine()} →</button>
+    ${S.settings.clubUrl ? '' : '<button class="cal-line" data-act="go" data-to="club">Join the club leaderboard →</button>'}
     <h2>Runs</h2>
     <div class="runs">${runs || '<p class="empty">No runs yet.</p>'}</div>
     ${nav('home')}`;
@@ -1322,11 +1362,9 @@ const actions = {
   },
   clubJoin: () => {
     const name = $('clubName').value.trim();
-    const url = S.clubInvite ?? $('clubUrl').value.trim();
     if (!name) return toast('Add the name the leaderboard should show');
-    if (!club.isClubUrl(url)) return toast('That isn’t a club link. It starts with https://script.google.com and ends in /exec.');
     S.settings.name = name.slice(0, 30);
-    joinClub(url);
+    joinClub(S.clubInvite ?? defaultClub());
   },
   clubDecline: () => {
     S.clubInvite = null;
@@ -1339,7 +1377,9 @@ const actions = {
     loadBoard();
   },
   clubInvite: async () => {
-    const link = club.inviteLink(location.origin + location.pathname, S.settings.clubUrl);
+    // The built-in club needs only the app's address.
+    const app = location.origin + location.pathname;
+    const link = S.settings.clubUrl === defaultClub() ? app : club.inviteLink(app, S.settings.clubUrl);
     try {
       if (navigator.share) await navigator.share({ title: 'Run Club', text: 'Join my Run Club leaderboard:', url: link });
       else {

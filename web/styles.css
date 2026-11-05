@@ -304,6 +304,37 @@ a {
   margin-top: 14px;
 }
 
+/* update bar */
+
+.update-bar {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  top: max(10px, env(safe-area-inset-top));
+  max-width: 488px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 10px 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 14px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
+  font-size: 14px;
+  z-index: 15;
+}
+
+.update-bar[hidden] {
+  display: none;
+}
+
+/* Room for the bar, so it doesn't cover the page's title. */
+body.has-update main {
+  padding-top: calc(max(16px, env(safe-area-inset-top)) + 64px);
+}
+
 /* install */
 
 .install {

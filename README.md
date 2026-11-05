@@ -87,12 +87,17 @@ measurement keeps outdoor calibration honest.
 ## Leaderboard
 
 The Club tab ranks everyone by distance this week. It also shows the whole
-club's combined distance, this week and all time. A club is a Google Sheet
-you own, with a small script that receives runs from the app. Only you
-sign in to Google, once, to set it up. Friends open your invite link and pick
-a name; no accounts, no logins.
+club's combined distance, this week and all time. **Joining takes a name and a
+tap:** the club's link is built into the app (`CLUB_URL` in `web/js/app.js`),
+so there's no link to paste and no account or login. To invite someone, send
+them the app's address; *Invite friends* on the Club tab does that.
 
-**Set up a club (about 5 minutes):**
+The club is a Google Sheet, with a small script that receives runs from the
+app. The link is in this public repository, so anyone who reads the code
+could post runs; delete a row in the sheet to take a run off the board.
+
+**Setting up a club (about 5 minutes).** This is how the built-in club was
+made; do it again to run a separate one, and point `CLUB_URL` at it:
 
 1. Create a Google Sheet (<https://sheets.new>) and name it, say, *Run Club*.
 2. In the sheet, choose **Extensions → Apps Script**. Delete the code that's
@@ -105,20 +110,21 @@ a name; no accounts, no logins.
    the app, that's because it's your own script: **Advanced → Go to …
    (unsafe) → Allow**. The script can only see this one spreadsheet.
 5. Copy the **Web app URL**. It ends in `/exec`.
-6. In Run Club, open the **Club** tab, enter your name, paste the link and
-   tap **Join**. Then tap **Invite friends** to send them the link.
+6. Put it in `CLUB_URL` and push. Alternatively, an invite link of the form
+   `https://theironchef.github.io/treadline/#club=<the URL, encoded>` lets
+   people join a club that isn't built in.
 
-Each run is a row in the sheet's *Runs* tab; delete a row to take a run off
-the board. Anyone with the invite link can post runs, so share it only with
-the club. Runs saved with no signal are sent the next time the app is online.
+Each run is a row in the sheet's *Runs* tab. Runs saved with no signal are
+sent the next time the app is online. The simulator only ever joins the local
+stand-in below, never the real club.
 
 If `Code.gs` changes later, paste the new version in the same place, then
 **Deploy → Manage deployments → ✎ Edit → Version: New version → Deploy**. The
 link stays the same.
 
-To try the Club tab locally, run `node leaderboard/dev-server.mjs` and use
-`http://localhost:5175/exec` as the club link. It's a stand-in that runs the
-real script on an in-memory sheet.
+To try the Club tab locally, run `node leaderboard/dev-server.mjs`, a
+stand-in that runs the real script on an in-memory sheet at
+`http://localhost:5175/exec`. In the simulator (`?sim=20`), Join uses it.
 
 ## Run it locally
 
@@ -151,8 +157,9 @@ shows an Install button when Chrome offers one. If the menu has no such
 option, the page is open inside another app's browser: choose *Open in
 Chrome* first. Every push to `main` runs the tests and redeploys `web/`
 (without `tests/`) through `.github/workflows/pages.yml`. An installed copy
-downloads a new version in the background each time it starts and shows it
-the next time, so after a deploy, close it from Recents and open it twice.
+checks for a new version each time it starts. When it finds one, it
+downloads the whole thing in the background and shows a **Reload** bar. The
+bar never appears mid-run; it waits until the run is saved.
 
 **Option B — over USB, no hosting.** With USB debugging on the phone and
 `adb` from the Android SDK platform-tools:

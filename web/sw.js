@@ -1,6 +1,7 @@
-// Offline shell: serve cached files immediately, refresh them in the
-// background so the next launch picks up a new deploy. Bump VERSION when the
-// file list changes.
+// Offline shell: serve cached files immediately and refresh them in the
+// background. When a refresh turns up a changed file, a new version has been
+// deployed: fetch the whole shell again, then tell open pages so they can
+// offer a reload. Bump VERSION when the file list changes.
 const VERSION = 'treadline-v3';
 const FILES = [
   './',
@@ -21,8 +22,12 @@ const FILES = [
   'js/store.js',
 ];
 
+// no-cache: revalidate with the server instead of trusting the HTTP cache,
+// where GitHub Pages lets a copy sit for 10 minutes.
+const fresh = (f) => new Request(f, { cache: 'no-cache' });
+
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)));
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES.map(fresh))));
   self.skipWaiting();
 });
 
@@ -40,15 +45,43 @@ self.addEventListener('fetch', (e) => {
   e.respondWith(
     caches.open(VERSION).then(async (cache) => {
       const cached = await cache.match(e.request, { ignoreSearch: true });
-      // no-cache: revalidate with the server instead of trusting the HTTP
-      // cache (GitHub Pages sends max-age=600), so a deploy shows up sooner.
-      const fresh = fetch(e.request, { cache: 'no-cache' })
-        .then((res) => {
-          if (res.ok) cache.put(e.request, res.clone());
+      // Copied now: once `cached` goes to the page its body is used up and it
+      // can't be cloned any more.
+      const previous = cached?.clone();
+      const update = fetch(e.request, { cache: 'no-cache' })
+        .then(async (res) => {
+          if (res.ok) {
+            const changed = previous && (await differs(previous, res.clone()));
+            await cache.put(e.request, res.clone());
+            if (changed) await refreshAll();
+          }
           return res;
         })
         .catch(() => cached);
-      return cached ?? fresh;
+      if (cached) e.waitUntil(update);
+      return cached ?? update;
     }),
   );
 });
+
+let refreshing = null;
+
+// addAll is all or nothing, so a reload never mixes old files with new.
+function refreshAll() {
+  refreshing ??= caches
+    .open(VERSION)
+    .then((c) => c.addAll(FILES.map(fresh)))
+    .then(() => self.clients.matchAll({ type: 'window' }))
+    .then((pages) => pages.forEach((p) => p.postMessage({ type: 'update-ready' })))
+    .catch(() => {})
+    .finally(() => (refreshing = null));
+  return refreshing;
+}
+
+async function differs(a, b) {
+  const [x, y] = await Promise.all([a.arrayBuffer(), b.arrayBuffer()]);
+  if (x.byteLength !== y.byteLength) return true;
+  const u = new Uint8Array(x);
+  const v = new Uint8Array(y);
+  return u.some((byte, i) => byte !== v[i]);
+}
