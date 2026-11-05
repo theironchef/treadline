@@ -457,7 +457,7 @@ function installCard() {
   if (SIM || installed() || S.settings.installHidden) return '<div id="install"></div>';
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
   const how = justInstalled
-    ? '<p class="hint"><b>Installed.</b> Open Treadline from your home screen or app drawer.</p>'
+    ? '<p class="hint"><b>Installed.</b> Open Run Club from your home screen or app drawer.</p>'
     : installOffer
     ? '<button class="btn small" data-act="install">Install app</button>'
     : ios
@@ -465,7 +465,7 @@ function installCard() {
       : `<p class="hint">In Chrome, tap <b>⋮</b> (top right), then <b>Install app</b>, or <b>Add to home screen</b> and then <b>Install</b>.</p>
         <p class="hint">No such option? The page is probably open inside another app. Tap <b>⋮</b> and choose <b>Open in Chrome</b> first.</p>`;
   return `<section id="install" class="card install">
-      <div class="install-head"><b>Install Treadline</b><button class="x" data-act="hideInstall" aria-label="Hide">×</button></div>
+      <div class="install-head"><b>Install Run Club</b><button class="x" data-act="hideInstall" aria-label="Hide">×</button></div>
       <p class="hint">It gets a home screen icon, opens full screen and works offline.</p>
       ${how}
     </section>`;
@@ -535,7 +535,7 @@ function home() {
     `<button role="radio" aria-checked="${S.settings.mode === m}" class="${S.settings.mode === m ? 'on' : ''}" data-act="mode" data-mode="${m}">${label}</button>`;
   const items = (n) => Array.from({ length: n }, (_, i) => `<div class="wheel-item" data-act="wheelPick" data-i="${i}">${i}</div>`).join('');
   return `
-    <header class="top"><h1>Treadline</h1>${SIM ? '<span class="pill">Simulator</span>' : ''}</header>
+    <header class="top"><h1>Run Club</h1>${SIM ? '<span class="pill">Simulator</span>' : ''}</header>
     ${unfinished}
     ${installCard()}
     <div class="mode" role="radiogroup" aria-label="Where you're running">${modeBtn('indoor', 'Indoor')}${modeBtn('outdoor', 'Outdoor')}</div>
@@ -1202,11 +1202,13 @@ function toast(text) {
 // ---------- backup ----------
 
 function exportData() {
+  // 'treadline' is the export format's id from before the rename; keep it so
+  // old and new backups import either way.
   const data = { app: 'treadline', version: 1, settings: S.settings, runs: S.runs, observations: S.observations };
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `treadline-${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = `run-club-${new Date().toISOString().slice(0, 10)}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
@@ -1214,7 +1216,7 @@ function exportData() {
 async function importData(file) {
   try {
     const data = JSON.parse(await file.text());
-    if (data.app !== 'treadline') throw new Error('Not a Treadline export');
+    if (data.app !== 'treadline') throw new Error('Not a Run Club export');
     for (const r of data.runs ?? []) await store.put('runs', r);
     for (const o of data.observations ?? []) await store.put('observations', o);
     S.runs = (await store.all('runs')).sort((a, b) => b.startedAt - a.startedAt);

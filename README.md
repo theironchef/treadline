@@ -1,4 +1,4 @@
-# Treadline
+# Run Club
 
 A run tracker that runs as an installable web app (PWA) on your phone and
 **calibrates its step counting against your treadmill and against GPS**.

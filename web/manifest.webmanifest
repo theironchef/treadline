@@ -1,7 +1,7 @@
 {
-  "name": "Treadline",
-  "short_name": "Treadline",
-  "description": "Treadmill run tracking that calibrates itself against your treadmill.",
+  "name": "Run Club",
+  "short_name": "Run Club",
+  "description": "Indoor and outdoor run tracking that calibrates step counting against GPS and your treadmill.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
