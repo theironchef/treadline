@@ -79,6 +79,7 @@ const $ = (id) => document.getElementById(id);
 // ---------- boot ----------
 
 async function boot() {
+  S.sensorGrace = performance.now() + SENSOR_GRACE_MS;
   const [settings, runs, observations, unfinished] = await Promise.all([
     store.getKv('settings'),
     store.all('runs'),
@@ -100,12 +101,17 @@ async function boot() {
   render();
   store.persist();
   flushClub();
-  // Android sends motion data without asking, so listen straight away. Newer
-  // Chrome has the same permission call as iOS, but doesn't need it; the
-  // Enable button only appears if no data arrives (iOS, or access blocked).
+  // Android sends motion data without asking, so listen straight away. Where
+  // the browser has a permission call (iOS, and newer Chrome), ask quietly
+  // too: it remembers a grant from an earlier tap, so the answer comes back
+  // with no prompt. The Enable button only appears if no data arrives at all.
+  // (The grace period started at the top of boot, so the button doesn't flash
+  // while the first readings are on their way.)
   if (SIM) enableSensor();
-  else if (PhoneLink.supported()) link().listen();
-  S.sensorGrace = performance.now() + SENSOR_GRACE_MS;
+  else if (PhoneLink.supported()) {
+    link().listen();
+    DeviceMotionEvent.requestPermission?.().then((state) => state === 'granted' && link().listen(), () => {});
+  }
   setTimeout(() => S.screen === 'home' && updateCheck(), SENSOR_GRACE_MS + 100);
   if ('serviceWorker' in navigator && !SIM) navigator.serviceWorker.register('sw.js').catch(() => {});
 }

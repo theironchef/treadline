@@ -119,9 +119,10 @@ export class PhoneLink extends LocalLink {
     this.listen();
   }
 
-  // Whether motion data is actually arriving.
+  // Whether motion data is actually arriving. (lastSampleAt starts at 0, so
+  // check for a sample at all: performance.now() is small just after load.)
   get receiving() {
-    return performance.now() - this.lastSampleAt < 3000;
+    return this.lastSampleAt > 0 && performance.now() - this.lastSampleAt < 3000;
   }
 
   disconnect() {
