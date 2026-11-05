@@ -36,6 +36,11 @@
   box-sizing: border-box;
 }
 
+/* `hidden` must win over classes that set display, like .btn. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
