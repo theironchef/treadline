@@ -196,6 +196,8 @@ function notePlace(a, carry) {
     a.source = calKey(won);
     a.rs.setBeta(modelFor(won).beta);
   }
+  // The phone is usually strapped or pocketed, out of sight: say it.
+  speak(`Phone detected: ${PLACE_NAMES[won].toLowerCase()}.`);
 }
 
 // Whether to offer the Enable button: no motion data, and the grace period
