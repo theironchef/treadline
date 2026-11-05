@@ -1,7 +1,7 @@
 // Offline shell: serve cached files immediately, refresh them in the
 // background so the next launch picks up a new deploy. Bump VERSION when the
 // file list changes.
-const VERSION = 'treadline-v2';
+const VERSION = 'treadline-v3';
 const FILES = [
   './',
   'index.html',
@@ -11,6 +11,7 @@ const FILES = [
   'icons/icon-512.png',
   'icons/maskable-512.png',
   'js/app.js',
+  'js/club.js',
   'js/format.js',
   'js/gps.js',
   'js/links.js',

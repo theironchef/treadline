@@ -76,9 +76,49 @@ measurement keeps outdoor calibration honest.
     phone moved) and left out unless you tick it back in.
   - *Outdoors:* nothing to type. Carry the phone the same way you do
     indoors, because each placement is calibrated separately.
-- **Back up** with *Export data* on the Calibrate tab. Everything is stored
-  only on the phone, in the browser's storage for this app.
+- **Club:** the Club tab has a weekly leaderboard with friends and the club's
+  combined distance. See [Leaderboard](#leaderboard).
+- **Back up** with *Export data* on the Calibrate tab. Your runs and
+  calibration are stored only on the phone, in the browser's storage for this
+  app. Uninstalling the app or clearing Chrome's data for the site can erase
+  them.
 - Splits are announced by voice (turn it off on the Calibrate tab).
+
+## Leaderboard
+
+The Club tab ranks everyone by distance this week. It also shows the whole
+club's combined distance, this week and all time. A club is a Google Sheet
+you own, with a small script that receives runs from the app. Only you
+sign in to Google, once, to set it up. Friends open your invite link and pick
+a name; no accounts, no logins.
+
+**Set up a club (about 5 minutes):**
+
+1. Create a Google Sheet (<https://sheets.new>) and name it, say, *Run Club*.
+2. In the sheet, choose **Extensions → Apps Script**. Delete the code that's
+   there, paste in all of [`leaderboard/Code.gs`](leaderboard/Code.gs), and
+   click **Save**.
+3. Choose **Deploy → New deployment**, click the gear next to *Select type*
+   and pick **Web app**. Set **Execute as: Me** and **Who has access:
+   Anyone** (not "Anyone with Google account"), then **Deploy**.
+4. Authorize it with your account. If Google warns that it hasn't verified
+   the app, that's because it's your own script: **Advanced → Go to …
+   (unsafe) → Allow**. The script can only see this one spreadsheet.
+5. Copy the **Web app URL**. It ends in `/exec`.
+6. In Run Club, open the **Club** tab, enter your name, paste the link and
+   tap **Join**. Then tap **Invite friends** to send them the link.
+
+Each run is a row in the sheet's *Runs* tab; delete a row to take a run off
+the board. Anyone with the invite link can post runs, so share it only with
+the club. Runs saved with no signal are sent the next time the app is online.
+
+If `Code.gs` changes later, paste the new version in the same place, then
+**Deploy → Manage deployments → ✎ Edit → Version: New version → Deploy**. The
+link stays the same.
+
+To try the Club tab locally, run `node leaderboard/dev-server.mjs` and use
+`http://localhost:5175/exec` as the club link. It's a stand-in that runs the
+real script on an in-memory sheet.
 
 ## Run it locally
 
@@ -106,10 +146,13 @@ Motion sensors and installing as an app both need HTTPS (or `localhost`).
 
 **Option A — the hosted copy (recommended).** Open
 <https://theironchef.github.io/treadline/> in Chrome on the phone, then
-*⋮ → Add to Home screen → Install*. Every push to `main` runs the tests and
-redeploys `web/` (without `tests/`) through
-`.github/workflows/pages.yml`. An installed copy picks up a deploy the
-second time it's opened.
+*⋮ → Install app* (or *Add to home screen → Install*); the start screen also
+shows an Install button when Chrome offers one. If the menu has no such
+option, the page is open inside another app's browser: choose *Open in
+Chrome* first. Every push to `main` runs the tests and redeploys `web/`
+(without `tests/`) through `.github/workflows/pages.yml`. An installed copy
+downloads a new version in the background each time it starts and shows it
+the next time, so after a deploy, close it from Recents and open it twice.
 
 **Option B — over USB, no hosting.** With USB debugging on the phone and
 `adb` from the Android SDK platform-tools:
@@ -131,7 +174,10 @@ twice: the first launch fetches the new version, the second shows it.
 | `web/js/links.js` | Phone accelerometer source, and the simulator |
 | `web/js/gps.js` | GPS distance filter, phone and simulated GPS |
 | `web/js/run.js` | Live distance, splits, GPS calibration stretches, voice updates |
+| `web/js/club.js` | Club leaderboard: posting runs, standings, invite links |
 | `web/js/app.js` | Screens and run flow |
+| `leaderboard/Code.gs` | The Google Sheet script that stores a club's runs |
+| `leaderboard/dev-server.mjs` | Local stand-in for the deployed script |
 | `web/js/store.js` | IndexedDB storage |
 | `web/sw.js` | Offline caching |
 | `.github/workflows/pages.yml` | Test and deploy to GitHub Pages |

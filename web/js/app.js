@@ -4,6 +4,7 @@ import { RunSession, Chunker, rescale, splits, milestones, announcement, usableC
 import { CMD } from './sensor.js';
 import { PhoneLink, SimLink } from './links.js';
 import { PhoneGps, SimGps, GpsTrack } from './gps.js';
+import * as club from './club.js';
 import * as fmt from './format.js';
 import { UNITS } from './format.js';
 
@@ -21,6 +22,9 @@ const GPS_SIGMA = 0.02;
 const MAX_GPS_ERR = 0.25;
 const WHEEL_ITEM = 40;
 const MAX_TARGET = 50;
+const CLUB_SETUP_URL = 'https://github.com/theironchef/treadline#leaderboard';
+// How long the Club tab trusts the board it last fetched.
+const CLUB_STALE_MS = 60000;
 
 const S = {
   // Saved as-is; targetM is meters, 0 for an open run.
@@ -32,6 +36,11 @@ const S = {
     segmentSpeed: '',
     mode: 'indoor',
     targetM: 3 * UNITS.mi.meters,
+    // Club: member is a random id for this phone, so a name can change.
+    name: '',
+    member: '',
+    clubUrl: '',
+    clubShare: true,
   },
   runs: [],
   observations: [],
@@ -44,6 +53,8 @@ const S = {
   active: null,
   finish: null,
   locked: false,
+  club: { data: null, at: 0, tried: 0, loading: false, error: null },
+  clubInvite: null, // a club link from an invite, waiting for Join
 };
 
 // In the simulator, devtools can reach the state, e.g. to fast-forward with
@@ -67,12 +78,18 @@ async function boot() {
   Object.assign(S.settings, settings);
   // The previous version called indoor runs 'treadmill'.
   if (S.settings.mode !== 'outdoor') S.settings.mode = 'indoor';
+  if (!S.settings.member) {
+    S.settings.member = store.newId();
+    saveSettings();
+  }
+  takeInvite();
   S.runs = runs.sort((a, b) => b.startedAt - a.startedAt);
   S.observations = observations;
   S.unfinished = unfinished;
   refit();
   render();
   store.persist();
+  flushClub();
   // Android grants motion data without a prompt, so start the sensor check
   // right away; iOS needs a tap first.
   if (SIM || typeof DeviceMotionEvent?.requestPermission !== 'function') enableSensor();
@@ -326,6 +343,7 @@ async function saveRun() {
     S.observations.push(x);
   }
   if (obs.length) refit();
+  if (S.settings.clubShare) sendToClub([{ type: 'run', run: clubRun(run) }]);
   await store.deleteKv('activeRun');
   S.finish = null;
   S.unfinished = null;
@@ -478,6 +496,182 @@ function refreshInstallCard() {
   if (el) el.outerHTML = installCard();
 }
 
+// ---------- club ----------
+
+// Simulated runs only ever go to the local stand-in club.
+const clubOn = () => !!S.settings.clubUrl && (!SIM || club.isLocal(S.settings.clubUrl));
+const clubName = () => S.settings.name.trim() || 'Runner';
+const myRuns = () => S.runs.filter((r) => (r.source === 'sim') === !!SIM);
+
+function clubRun(r) {
+  return {
+    id: r.id,
+    member: S.settings.member,
+    name: clubName(),
+    started: r.startedAt,
+    meters: Math.round(r.distance),
+    seconds: Math.round(r.seconds),
+    place: r.mode === 'outdoor' ? 'outdoor' : 'indoor',
+  };
+}
+
+// Changes wait in an outbox until the club confirms them, so a run saved
+// with no signal (a basement gym) goes out the next time there is one.
+// Sending one twice does no harm: a run is replaced by its id.
+async function queueForClub(ops) {
+  if (!clubOn() || !ops.length) return;
+  await store.setKv('clubOutbox', [...((await store.getKv('clubOutbox')) ?? []), ...ops]);
+}
+
+async function sendToClub(ops) {
+  await queueForClub(ops);
+  return flushClub();
+}
+
+let flushing = null;
+function flushClub() {
+  if (!clubOn() || flushing) return flushing;
+  flushing = (async () => {
+    try {
+      for (;;) {
+        const box = (await store.getKv('clubOutbox')) ?? [];
+        if (!box.length) break;
+        await club.post(S.settings.clubUrl, box);
+        // Keep anything queued while that was in flight.
+        await store.setKv('clubOutbox', ((await store.getKv('clubOutbox')) ?? []).slice(box.length));
+      }
+      S.club.error = null;
+    } catch {
+      S.club.error = 'Couldn’t reach the club. Your runs will go out when you’re back online.';
+    } finally {
+      flushing = null;
+    }
+  })();
+  return flushing;
+}
+
+async function loadBoard() {
+  if (!clubOn()) return;
+  S.club.loading = true;
+  S.club.tried = Date.now();
+  try {
+    await flushClub();
+    S.club.data = await club.load(S.settings.clubUrl, club.weekStart());
+    S.club.at = Date.now();
+  } catch {
+    S.club.error = 'Couldn’t reach the club. Check your connection and refresh.';
+  } finally {
+    S.club.loading = false;
+    if (S.screen === 'club') render();
+  }
+}
+
+// An invite link is the app's address with #club=<link>. Show it on the Club
+// tab, and take it out of the address so it isn't reopened or bookmarked.
+// Checked at startup and on hashchange: tapping an invite while the app is
+// open only changes the fragment, without reloading the page.
+function takeInvite() {
+  const invited = club.clubFromHash(location.hash);
+  if (!invited) return false;
+  history.replaceState(null, '', location.pathname + location.search);
+  if (invited !== S.settings.clubUrl) S.clubInvite = invited;
+  // Mid-run the invite waits on the Club tab until the run is over.
+  if (!S.active) S.screen = 'club';
+  return true;
+}
+
+window.addEventListener('hashchange', () => {
+  if (takeInvite() && !S.active) render();
+});
+
+async function joinClub(url) {
+  S.settings.clubUrl = url;
+  S.clubInvite = null;
+  saveSettings();
+  S.club = { data: null, at: 0, tried: 0, loading: false, error: null };
+  await store.deleteKv('clubOutbox');
+  // Runs you already have count too.
+  if (S.settings.clubShare) await queueForClub(myRuns().map((r) => ({ type: 'run', run: clubRun(r) })));
+  render();
+}
+
+function clubScreen() {
+  if (S.clubInvite || !S.settings.clubUrl) return clubSetup();
+  const u = unit();
+  const units = S.settings.units;
+  const c = S.club;
+  const d = c.data;
+  const rows = d ? club.standings(d.runs) : [];
+  const week = rows.reduce((s, r) => s + r.meters, 0);
+  const me = S.settings.member;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const board = rows
+    .map(
+      (r, i) => `<li class="${r.member === me ? 'me' : ''}">
+        <span class="rank">${i + 1}</span>
+        <span class="who">${fmt.escape(r.name)}${r.member === me ? '<small>you</small>' : ''}</span>
+        <span class="dist"><b>${fmt.distance(r.meters, units)}</b> ${u.label}<small>${plural(r.runs, 'run')}</small></span>
+      </li>`,
+    )
+    .join('');
+  const waiting = c.loading || (!c.at && !c.error);
+  const status = waiting ? 'Updating…' : c.at ? `Updated ${fmt.time(c.at)}` : 'Not updated yet';
+  return `
+    <header class="top"><h1>Club</h1></header>
+    <section class="card club-total">
+      <span class="label">Everyone, this week</span>
+      <div class="hero small"><b>${d ? fmt.distance(week, units) : '–'}</b><span>${u.label}</span></div>
+      <p class="hint">${d ? `All time: ${fmt.distance(d.total.meters, units)} ${u.label} by ${plural(d.total.members, 'runner')}, ${plural(d.total.runs, 'run')}` : '&nbsp;'}</p>
+    </section>
+    <h2>Leaderboard · this week</h2>
+    ${board ? `<ol class="board">${board}</ol>` : `<p class="empty">${d ? 'No runs yet this week.' : waiting ? 'Loading…' : ''}</p>`}
+    ${c.error ? `<p class="warn">${c.error}</p>` : ''}
+    <p class="board-status">${status} · <button class="link" data-act="clubRefresh">Refresh</button></p>
+    <section class="card settings">
+      <label class="field">Your name on the board
+        <input id="clubName" type="text" maxlength="30" autocomplete="nickname" value="${fmt.escape(S.settings.name)}" placeholder="Runner">
+      </label>
+      <label class="check-row"><input id="clubShare" type="checkbox" ${S.settings.clubShare ? 'checked' : ''}> Share my runs with the club</label>
+      <div class="row club-actions">
+        <button class="btn small" data-act="clubInvite">Invite friends</button>
+        <button class="btn small ghost" data-act="clubLeave">Leave club</button>
+      </div>
+    </section>
+    ${nav('club')}`;
+}
+
+function clubSetup() {
+  const invite = S.clubInvite;
+  const switching = invite && S.settings.clubUrl;
+  return `
+    <header class="top"><h1>Club</h1></header>
+    <section class="card">
+      <h3>${invite ? 'You’re invited to a Run Club' : 'Join a club'}</h3>
+      <p class="hint">${
+        invite
+          ? `Pick the name the leaderboard shows for you.${switching ? ' Joining moves you out of your current club.' : ''}`
+          : 'Open the invite link a friend sent you, or paste the club link here.'
+      }</p>
+      <label class="field">Your name on the board
+        <input id="clubName" type="text" maxlength="30" autocomplete="nickname" value="${fmt.escape(S.settings.name)}" placeholder="Name">
+      </label>
+      ${invite ? '' : '<label class="field">Club link<input id="clubUrl" type="url" inputmode="url" placeholder="https://script.google.com/macros/s/…/exec"></label>'}
+      <div class="row club-actions">
+        <button class="btn" data-act="clubJoin">Join</button>
+        ${invite ? '<button class="btn ghost" data-act="clubDecline">Not now</button>' : ''}
+      </div>
+    </section>
+    ${
+      invite
+        ? ''
+        : `<section class="card">
+      <h3>Start a club</h3>
+      <p class="hint">A club is a Google Sheet you own, set up once in about five minutes. Nobody else needs an account or a login. <a href="${CLUB_SETUP_URL}" target="_blank" rel="noopener">How to set one up</a></p>
+    </section>`
+    }
+    ${nav('club')}`;
+}
+
 // ---------- rendering ----------
 
 function go(screen, extra = {}) {
@@ -487,7 +681,7 @@ function go(screen, extra = {}) {
 }
 
 function render() {
-  const screens = { home, live, finish, run: runDetail, calibrate };
+  const screens = { home, live, finish, run: runDetail, calibrate, club: clubScreen };
   $app.innerHTML = screens[S.screen]();
   document.body.dataset.screen = S.screen;
   syncGps();
@@ -496,12 +690,13 @@ function render() {
     mountWheels();
     updateCheck();
   }
+  if (S.screen === 'club' && !S.club.loading && Date.now() - S.club.tried > CLUB_STALE_MS) loadBoard();
 }
 
 function nav(active) {
   const tab = (id, label) =>
     `<button class="tab ${active === id ? 'on' : ''}" data-act="go" data-to="${id}">${label}</button>`;
-  return `<nav class="tabs">${tab('home', 'Run')}${tab('calibrate', 'Calibrate')}</nav>`;
+  return `<nav class="tabs">${tab('home', 'Run')}${tab('club', 'Club')}${tab('calibrate', 'Calibrate')}</nav>`;
 }
 
 function calibrationLine() {
@@ -1088,6 +1283,7 @@ const actions = {
     S.runs = S.runs.filter((r) => r.id !== id);
     S.observations = S.observations.filter((o) => !gone.includes(o));
     refit();
+    sendToClub([{ type: 'delete', id, member: S.settings.member }]);
     go('home');
   },
   segOpen: () => {
@@ -1123,6 +1319,45 @@ const actions = {
     S.settings.installHidden = true;
     saveSettings();
     refreshInstallCard();
+  },
+  clubJoin: () => {
+    const name = $('clubName').value.trim();
+    const url = S.clubInvite ?? $('clubUrl').value.trim();
+    if (!name) return toast('Add the name the leaderboard should show');
+    if (!club.isClubUrl(url)) return toast('That isn’t a club link. It starts with https://script.google.com and ends in /exec.');
+    S.settings.name = name.slice(0, 30);
+    joinClub(url);
+  },
+  clubDecline: () => {
+    S.clubInvite = null;
+    render();
+  },
+  clubRefresh: () => {
+    S.club.loading = true;
+    render();
+    S.club.loading = false;
+    loadBoard();
+  },
+  clubInvite: async () => {
+    const link = club.inviteLink(location.origin + location.pathname, S.settings.clubUrl);
+    try {
+      if (navigator.share) await navigator.share({ title: 'Run Club', text: 'Join my Run Club leaderboard:', url: link });
+      else {
+        await navigator.clipboard.writeText(link);
+        toast('Invite link copied. Send it to your friends.');
+      }
+    } catch (e) {
+      // Closing the share sheet isn't an error.
+      if (e?.name !== 'AbortError') prompt('Copy this invite link', link);
+    }
+  },
+  clubLeave: async () => {
+    if (!confirm('Leave this club? Your runs stay on its leaderboard.')) return;
+    S.settings.clubUrl = '';
+    saveSettings();
+    await store.deleteKv('clubOutbox');
+    S.club = { data: null, at: 0, tried: 0, loading: false, error: null };
+    render();
   },
 };
 
@@ -1163,6 +1398,17 @@ $app.addEventListener('change', async (e) => {
   } else if (el.id === 'voice') {
     S.settings.voice = el.checked;
     saveSettings();
+  } else if (el.id === 'clubName') {
+    S.settings.name = el.value.trim().slice(0, 30);
+    saveSettings();
+    if (clubOn() && !S.clubInvite) {
+      sendToClub([{ type: 'rename', member: S.settings.member, name: clubName() }]).then(() => S.screen === 'club' && loadBoard());
+    }
+  } else if (el.id === 'clubShare') {
+    S.settings.clubShare = el.checked;
+    saveSettings();
+    // Catch up on runs saved while sharing was off.
+    if (el.checked) sendToClub(myRuns().map((r) => ({ type: 'run', run: clubRun(r) })));
   } else if (el.id === 'import') {
     importData(el.files[0]);
   }

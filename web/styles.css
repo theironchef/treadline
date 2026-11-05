@@ -219,6 +219,91 @@ b {
   padding: 6px;
 }
 
+a {
+  color: var(--accent);
+}
+
+/* club */
+
+.club-total .hero {
+  margin: 6px 0 2px;
+}
+
+.board {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.board li {
+  display: grid;
+  grid-template-columns: 26px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.board li.me {
+  border-color: var(--accent);
+}
+
+.board .rank {
+  font-weight: 700;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.board li:first-child .rank {
+  color: var(--accent);
+}
+
+.board .who {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board .who small {
+  margin-left: 6px;
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.board .dist {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.board .dist b {
+  font-size: 18px;
+  color: var(--text);
+}
+
+.board .dist small {
+  display: block;
+  font-size: 12px;
+}
+
+.board-status {
+  margin: 10px 0 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.club-actions {
+  margin-top: 14px;
+}
+
 /* install */
 
 .install {
@@ -591,6 +676,8 @@ b {
 }
 
 input[type='number'],
+input[type='text'],
+input[type='url'],
 select {
   display: block;
   width: 100%;
