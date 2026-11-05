@@ -1,0 +1,864 @@
+import * as store from './store.js';
+import { fit, prior, predict, features, diffMoments, summarize, speed, REF, UNCALIBRATED_ERROR } from './model.js';
+import { RunSession, rescale, splits } from './run.js';
+import { CMD } from './sensor.js';
+import { PhoneLink, SimLink } from './links.js';
+import * as fmt from './format.js';
+import { UNITS } from './format.js';
+
+const params = new URLSearchParams(location.search);
+// ?sim or ?sim=20 swaps the phone's accelerometer for a simulated runner.
+const SIM = params.has('sim') ? Number(params.get('sim')) || 1 : 0;
+
+const PLACEMENTS = { pocket: 'Front pocket', armband: 'Armband', waist: 'Waistband' };
+const MIN_SEGMENT_S = 60;
+
+const S = {
+  settings: { units: 'mi', heightM: 1.75, placement: 'pocket', voice: true, segmentSpeed: '' },
+  runs: [],
+  observations: [],
+  model: null,
+  link: null,
+  live: null,
+  screen: 'home',
+  runId: null,
+  active: null,
+  finish: null,
+  locked: false,
+};
+
+const $app = document.getElementById('app');
+const source = () => (SIM ? 'sim' : S.settings.placement);
+const unit = () => UNITS[S.settings.units];
+const $ = (id) => document.getElementById(id);
+
+// ---------- boot ----------
+
+async function boot() {
+  const [settings, runs, observations, unfinished] = await Promise.all([
+    store.getKv('settings'),
+    store.all('runs'),
+    store.all('observations'),
+    store.getKv('activeRun'),
+  ]);
+  Object.assign(S.settings, settings);
+  S.runs = runs.sort((a, b) => b.startedAt - a.startedAt);
+  S.observations = observations;
+  S.unfinished = unfinished;
+  refit();
+  render();
+  store.persist();
+  // Android grants motion data without a prompt, so start the sensor check
+  // right away; iOS needs a tap first.
+  if (SIM || typeof DeviceMotionEvent?.requestPermission !== 'function') enableSensor();
+  if ('serviceWorker' in navigator && !SIM) navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+function refit() {
+  const obs = S.observations.filter((o) => o.source === source());
+  S.model = fit(obs, prior(S.settings.heightM));
+  S.active?.rs.setBeta(S.model.beta);
+}
+
+function saveSettings() {
+  store.setKv('settings', S.settings);
+}
+
+// ---------- sensor ----------
+
+function link() {
+  if (!S.link) {
+    S.link = SIM ? new SimLink(SIM) : new PhoneLink();
+    S.link.addEventListener('live', (e) => onLive(e.detail));
+    S.link.addEventListener('status', () => S.screen === 'home' && render());
+  }
+  return S.link;
+}
+
+async function enableSensor() {
+  if (!SIM && !PhoneLink.supported()) return toast('This browser has no motion sensor access');
+  try {
+    await link().pick();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+function onLive(p) {
+  S.live = p;
+  const a = S.active;
+  if (a && p.sessionId === a.sessionId) {
+    a.rs.onLive(p);
+    announceSplit(a);
+  }
+  if (S.screen === 'live') updateLive();
+  else if (S.screen === 'home') updateCheck();
+}
+
+function signal(p) {
+  if (!p || !S.link?.connected) return { cls: 'off', text: 'Sensor off' };
+  if (p.cadence === 0 && p.intensity < 0.04) return { cls: 'idle', text: 'Still' };
+  if (p.quality >= 0.5) return { cls: 'ok', text: 'Strong rhythm' };
+  if (p.quality >= 0.3) return { cls: 'ok', text: 'Rhythm OK' };
+  return { cls: 'weak', text: 'Weak signal' };
+}
+
+// ---------- run lifecycle ----------
+
+async function startRun() {
+  const l = link();
+  if (!l.connected) await enableSensor();
+  if (!l.connected) return;
+  await l.control(CMD.START);
+  const sums = await l.readSums();
+  const rs = new RunSession(S.model.beta);
+  rs.onSums(sums);
+  S.active = {
+    id: store.newId(),
+    startedAt: Date.now(),
+    sessionId: sums.sessionId,
+    source: source(),
+    rs,
+    lastSums: sums,
+    paused: false,
+    segment: null,
+    segmentForm: false,
+    announced: 0,
+  };
+  S.active.timers = [setInterval(syncSums, 3000), setInterval(saveActive, 10000)];
+  S.locked = false;
+  wakeLock(true);
+  speak('Run started');
+  go('live');
+}
+
+async function syncSums() {
+  const a = S.active;
+  if (!a) return;
+  const sums = await S.link.readSums();
+  if (sums.sessionId !== a.sessionId) return;
+  a.rs.onSums(sums);
+  a.lastSums = sums;
+}
+
+// Enough to finish the run later if the page is closed or reloaded mid-run.
+function saveActive() {
+  const a = S.active;
+  if (!a) return;
+  store.setKv('activeRun', {
+    id: a.id,
+    startedAt: a.startedAt,
+    source: a.source,
+    sums: a.lastSums,
+    timeline: a.rs.timeline,
+  });
+}
+
+async function togglePause() {
+  const a = S.active;
+  a.paused = !a.paused;
+  if (a.paused) a.segment = null;
+  await S.link.control(a.paused ? CMD.PAUSE : CMD.RESUME);
+  speak(a.paused ? 'Paused' : 'Resumed');
+  renderLive();
+}
+
+async function finishRun() {
+  const a = S.active;
+  await S.link.control(CMD.PAUSE);
+  const sums = await S.link.readSums();
+  await S.link.control(CMD.STOP);
+  a.timers.forEach(clearInterval);
+  S.active = null;
+  wakeLock(false);
+  openFinish({ id: a.id, startedAt: a.startedAt, source: a.source, sums, timeline: a.rs.timeline });
+}
+
+function openFinish(saved) {
+  const estimate = predict(S.model.beta, features(saved.sums.moments));
+  S.finish = { ...saved, estimate, treadmillHint: S.link?.treadmillMeters };
+  store.setKv('activeRun', saved);
+  go('finish');
+}
+
+async function saveRun() {
+  const f = S.finish;
+  const typed = parseFloat($('treadmill').value);
+  const treadmill = typed > 0 ? typed * unit().meters : null;
+  const distance = treadmill ?? f.estimate;
+  const sum = summarize(f.sums.moments);
+  const run = {
+    id: f.id,
+    startedAt: f.startedAt,
+    source: f.source,
+    seconds: f.sums.elapsedMs / 1000,
+    gapSeconds: f.sums.gapMs / 1000,
+    distance,
+    estimate: f.estimate,
+    treadmill: !!treadmill,
+    steps: f.sums.steps,
+    cadence: sum.cadence,
+    moments: f.sums.moments,
+    timeline: rescale(f.timeline, distance),
+  };
+  await store.put('runs', run);
+  S.runs.unshift(run);
+  if (treadmill) {
+    const o = {
+      id: `run-${f.id}`,
+      runId: f.id,
+      kind: 'run',
+      source: f.source,
+      t: f.startedAt,
+      moments: f.sums.moments,
+      distance: treadmill,
+      seconds: run.seconds,
+      sigma: 0.01,
+      include: $('useCal').checked,
+    };
+    await store.put('observations', o);
+    S.observations.push(o);
+    refit();
+  }
+  await store.deleteKv('activeRun');
+  S.finish = null;
+  S.unfinished = null;
+  S.runId = run.id;
+  go('run');
+}
+
+async function discardRun() {
+  if (!confirm('Discard this run?')) return;
+  await store.deleteKv('activeRun');
+  S.finish = null;
+  S.unfinished = null;
+  go('home');
+}
+
+// ---------- calibration segments ----------
+
+async function startSegment() {
+  const v = parseFloat($('segSpeed').value);
+  if (!(v > 0)) return toast('Enter the treadmill speed');
+  S.settings.segmentSpeed = String(v);
+  saveSettings();
+  const start = await S.link.readSums();
+  S.active.segment = { speed: v, mps: v / unit().speedFactor, start };
+  S.active.segmentForm = false;
+  speak('Segment started. Hold steady.');
+  renderSegment();
+}
+
+async function endSegment() {
+  const a = S.active;
+  const seg = a.segment;
+  a.segment = null;
+  const end = await S.link.readSums();
+  const seconds = (end.elapsedMs - seg.start.elapsedMs) / 1000;
+  renderSegment();
+  if (end.gapMs > seg.start.gapMs) return toast('Segment discarded: the sensor dropped out. Keep the screen on.');
+  if (seconds < MIN_SEGMENT_S) return toast('Segment too short');
+  const o = {
+    id: `seg-${store.newId()}`,
+    runId: a.id,
+    kind: 'segment',
+    source: a.source,
+    t: Date.now(),
+    moments: diffMoments(end.moments, seg.start.moments),
+    distance: seg.mps * seconds,
+    seconds,
+    label: `${seg.speed} ${unit().speed}`,
+    sigma: 0.015,
+    include: true,
+  };
+  await store.put('observations', o);
+  S.observations.push(o);
+  refit();
+  speak('Calibration saved');
+  toast(`Saved ${o.label} segment — calibration updated`);
+}
+
+// ---------- voice + wake lock ----------
+
+function speak(text) {
+  if (!S.settings.voice || !('speechSynthesis' in window)) return;
+  speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+}
+
+function announceSplit(a) {
+  const u = unit();
+  const k = Math.floor(a.rs.shown / u.meters);
+  if (k <= a.announced) return;
+  a.announced = k;
+  const full = splits(a.rs.timeline, u.meters).filter((s) => s.fraction === 1);
+  const last = full[full.length - 1];
+  if (!last) return;
+  const word = u.label === 'mi' ? (k === 1 ? 'mile' : 'miles') : k === 1 ? 'kilometer' : 'kilometers';
+  const m = Math.floor(last.seconds / 60);
+  const s = Math.round(last.seconds % 60);
+  speak(`${k} ${word}. Split ${m} minutes ${s} seconds.`);
+}
+
+let lock = null;
+async function wakeLock(on) {
+  try {
+    if (on && !lock && navigator.wakeLock) {
+      lock = await navigator.wakeLock.request('screen');
+      lock.addEventListener('release', () => (lock = null));
+    } else if (!on && lock) {
+      await lock.release();
+      lock = null;
+    }
+  } catch {}
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S.active) wakeLock(true);
+});
+
+// ---------- rendering ----------
+
+function go(screen, extra = {}) {
+  Object.assign(S, extra, { screen });
+  render();
+  window.scrollTo(0, 0);
+}
+
+function render() {
+  const screens = { home, live, finish, run: runDetail, calibrate };
+  $app.innerHTML = screens[S.screen]();
+  document.body.dataset.screen = S.screen;
+  if (S.screen === 'live') renderLive();
+  if (S.screen === 'home') updateCheck();
+}
+
+function nav(active) {
+  const tab = (id, label) =>
+    `<button class="tab ${active === id ? 'on' : ''}" data-act="go" data-to="${id}">${label}</button>`;
+  return `<nav class="tabs">${tab('home', 'Run')}${tab('calibrate', 'Calibrate')}</nav>`;
+}
+
+function calibrationLine() {
+  const m = S.model;
+  if (!m.count) return `Not calibrated · estimates may be off ±${Math.round(UNCALIBRATED_ERROR * 100)}%`;
+  const err = m.error ? ` · typical error ±${(m.error.rms * 100).toFixed(1)}%` : '';
+  return `Calibrated from ${m.count} ${m.count === 1 ? 'measurement' : 'measurements'}${err}`;
+}
+
+function home() {
+  const u = unit();
+  const unfinished = S.unfinished
+    ? `<div class="card banner">
+        <div><b>Unfinished run</b><span>${fmt.date(S.unfinished.startedAt)} · ${fmt.clock(S.unfinished.sums.elapsedMs / 1000)}</span></div>
+        <div class="row"><button class="btn small" data-act="resumeFinish">Finish it</button><button class="btn small ghost" data-act="dropUnfinished">Discard</button></div>
+      </div>`
+    : '';
+  const runs = S.runs
+    .filter((r) => r.source !== 'sim' || SIM)
+    .slice(0, 30)
+    .map(
+      (r) => `<button class="run-row" data-act="openRun" data-id="${r.id}">
+        <span class="run-date">${fmt.date(r.startedAt)}<small>${fmt.time(r.startedAt)}</small></span>
+        <span class="run-dist">${fmt.distance(r.distance, S.settings.units)}<small>${u.label}</small></span>
+        <span class="run-meta">${fmt.clock(r.seconds)}<small>${fmt.paceFromSeconds(r.seconds, r.distance, S.settings.units)} /${u.label}</small></span>
+      </button>`,
+    )
+    .join('');
+  return `
+    <header class="top"><h1>Treadline</h1>${SIM ? '<span class="pill">Simulator</span>' : ''}</header>
+    ${unfinished}
+    <section class="card sensor">
+      <div class="sensor-head">
+        <span class="label">Sensor · ${SIM ? 'Simulated runner' : PLACEMENTS[S.settings.placement]}</span>
+        <span id="checkSig" class="sig"></span>
+      </div>
+      <div class="check"><b id="checkCad">–</b><span>steps / min</span></div>
+      <p class="hint">${
+        SIM
+          ? 'A simulated runner follows a treadmill program: 3 min walk, then 6, 7 and 6.5 mph.'
+          : 'Put the phone where it will ride during the run and walk around. The cadence here should match your steps.'
+      }</p>
+      ${S.link?.connected ? '' : '<button class="btn small" data-act="enable">Enable motion sensor</button>'}
+    </section>
+    <button class="btn start" data-act="start">Start treadmill run</button>
+    <button class="cal-line" data-act="go" data-to="calibrate">${calibrationLine()} →</button>
+    <h2>Runs</h2>
+    <div class="runs">${runs || '<p class="empty">No runs yet.</p>'}</div>
+    ${nav('home')}`;
+}
+
+function updateCheck() {
+  const p = S.live;
+  const sig = signal(p);
+  if ($('checkCad')) $('checkCad').textContent = p && p.cadence > 0 ? Math.round(p.cadence) : '0';
+  if ($('checkSig')) {
+    $('checkSig').className = `sig ${sig.cls}`;
+    $('checkSig').textContent = sig.text;
+  }
+}
+
+function live() {
+  const u = unit();
+  return `
+    <section class="live">
+      <header class="live-top">
+        <span id="sig" class="sig"></span>
+        <button class="btn small ghost" data-act="lock">Lock screen</button>
+      </header>
+      <div class="hero"><b id="dist">0.00</b><span>${u.label}</span></div>
+      <div class="stats">
+        <div><b id="pace">–:––</b><span>Pace /${u.label}</span></div>
+        <div><b id="time">0:00</b><span>Time</span></div>
+        <div><b id="avg">–:––</b><span>Avg /${u.label}</span></div>
+        <div><b id="spd">0.0</b><span>${u.speed}</span></div>
+        <div><b id="cad">0</b><span>Cadence</span></div>
+        <div><b id="steps">0</b><span>Steps</span></div>
+      </div>
+      <p id="gap" class="warn" hidden></p>
+      <div id="seg"></div>
+      <div id="controls" class="controls"></div>
+      <div id="lockLayer" class="lock-layer" hidden>
+        <div class="lock-ring" id="unlock"><span>Hold to unlock</span></div>
+      </div>
+    </section>`;
+}
+
+function renderLive() {
+  const a = S.active;
+  if (!a) return;
+  $('controls').innerHTML = a.paused
+    ? `<button class="btn big" data-act="pause">Resume</button><button class="btn big danger" data-act="finish">Finish</button>`
+    : `<button class="btn big" data-act="pause">Pause</button>`;
+  $('lockLayer').hidden = !S.locked;
+  renderSegment();
+  updateLive();
+}
+
+function renderSegment() {
+  const a = S.active;
+  const el = $('seg');
+  if (!a || !el) return;
+  const u = unit();
+  if (a.paused) {
+    el.innerHTML = '';
+  } else if (a.segment) {
+    el.innerHTML = `<div class="card seg active">
+      <div><b>Calibrating at ${a.segment.speed} ${u.speed}</b><span id="segTime">0:00</span></div>
+      <p class="hint">Stay at this speed and don't touch the rails.</p>
+      <div class="row"><button class="btn small" id="segEnd" data-act="segEnd" disabled>Save segment</button><button class="btn small ghost" data-act="segCancel">Cancel</button></div>
+    </div>`;
+  } else if (a.segmentForm) {
+    el.innerHTML = `<div class="card seg">
+      <label>Treadmill speed (${u.speed})
+        <input id="segSpeed" type="number" inputmode="decimal" step="0.1" min="0.5" value="${fmt.escape(S.settings.segmentSpeed)}">
+      </label>
+      <p class="hint">Get steady at this speed first. Hold it for at least a minute; two is better.</p>
+      <div class="row"><button class="btn small" data-act="segStart">Start segment</button><button class="btn small ghost" data-act="segClose">Cancel</button></div>
+    </div>`;
+  } else {
+    el.innerHTML = `<button class="btn ghost wide" data-act="segOpen">Calibrate at this speed</button>`;
+  }
+}
+
+function updateLive() {
+  const a = S.active;
+  if (!a || !$('dist')) return;
+  const units = S.settings.units;
+  const p = S.live;
+  const rs = a.rs;
+  const elapsed = (p && p.sessionId === a.sessionId ? p.elapsedMs : a.lastSums.elapsedMs) / 1000;
+  $('dist').textContent = fmt.distance(rs.shown, units);
+  $('time').textContent = fmt.clock(elapsed);
+  $('pace').textContent = a.paused ? '–:––' : fmt.pace(rs.currentSpeed, units);
+  $('avg').textContent = fmt.paceFromSeconds(elapsed - (p?.gapMs ?? 0) / 1000, rs.shown, units);
+  $('spd').textContent = a.paused ? '0.0' : (rs.currentSpeed * unit().speedFactor).toFixed(1);
+  $('cad').textContent = p ? Math.round(p.cadence) : 0;
+  $('steps').textContent = p ? p.steps.toLocaleString() : 0;
+  const sig = signal(p);
+  $('sig').className = `sig ${a.paused ? 'idle' : sig.cls}`;
+  $('sig').textContent = a.paused ? 'Paused' : sig.text;
+  const gap = p?.gapMs ?? 0;
+  $('gap').hidden = gap === 0;
+  if (gap) $('gap').textContent = `${fmt.clock(gap / 1000)} not tracked: the screen went off or the app was in the background. Keep this screen open while running.`;
+  if (a.segment && $('segTime')) {
+    const s = (elapsed * 1000 - a.segment.start.elapsedMs) / 1000;
+    $('segTime').textContent = fmt.clock(s);
+    $('segEnd').disabled = s < MIN_SEGMENT_S;
+  }
+}
+
+function finish() {
+  const f = S.finish;
+  const u = unit();
+  const units = S.settings.units;
+  const gap = f.sums.gapMs / 1000;
+  const sum = summarize(f.sums.moments);
+  const hint =
+    f.treadmillHint > 0
+      ? `<button class="link" data-act="fillHint">Simulated treadmill shows ${fmt.distance(f.treadmillHint, units)} ${u.label}</button>`
+      : '';
+  return `
+    <header class="top"><h1>Run complete</h1></header>
+    <section class="card">
+      <div class="stats">
+        <div><b>${fmt.clock(f.sums.elapsedMs / 1000)}</b><span>Time</span></div>
+        <div><b>${fmt.distance(f.estimate, units)}</b><span>Estimate (${u.label})</span></div>
+        <div><b>${Math.round(sum.cadence)}</b><span>Avg cadence</span></div>
+      </div>
+    </section>
+    ${gap > 0 ? `<p class="warn">${fmt.clock(gap)} of this run had no sensor data, so the estimate is short. It is left out of calibration unless you tick the box.</p>` : ''}
+    <section class="card">
+      <label class="field">Treadmill distance
+        <span class="input-unit"><input id="treadmill" type="number" inputmode="decimal" step="0.01" min="0" placeholder="${fmt.distance(f.estimate, units)}"><span>${u.label}</span></span>
+      </label>
+      ${hint}
+      <p id="compare" class="hint">Enter what the treadmill shows. The app learns from the difference.</p>
+      <label class="check-row"><input id="useCal" type="checkbox" ${gap > 0 ? '' : 'checked'}> Use this run to calibrate</label>
+    </section>
+    <div class="row end">
+      <button class="btn ghost" data-act="discard">Discard</button>
+      <button class="btn" data-act="save">Save run</button>
+    </div>`;
+}
+
+function updateCompare() {
+  const f = S.finish;
+  const typed = parseFloat($('treadmill').value);
+  const el = $('compare');
+  if (!(typed > 0)) {
+    el.textContent = 'Enter what the treadmill shows. The app learns from the difference.';
+    el.className = 'hint';
+    return;
+  }
+  const err = f.estimate / (typed * unit().meters) - 1;
+  const off = Math.abs(err) > 0.2;
+  el.className = off ? 'warn' : 'hint';
+  el.textContent = off
+    ? `The estimate is ${fmt.percent(err)} off the treadmill. That big a gap usually means the phone moved or you held the rails, so this run is left out of calibration.`
+    : `The app's estimate was ${(Math.abs(err) * 100).toFixed(1)}% ${err > 0 ? 'long' : 'short'}.`;
+  if (off) $('useCal').checked = false;
+}
+
+function runDetail() {
+  const r = S.runs.find((x) => x.id === S.runId);
+  if (!r) return home();
+  const u = unit();
+  const units = S.settings.units;
+  const sp = splits(r.timeline, u.meters);
+  const compare = r.treadmill
+    ? `<p class="hint">App estimate ${fmt.distance(r.estimate, units)} ${u.label} (${fmt.percent(r.estimate / r.distance - 1)}) vs treadmill ${fmt.distance(r.distance, units)} ${u.label}.</p>`
+    : '<p class="hint">Saved without a treadmill distance, so this is the app’s estimate.</p>';
+  const rows = sp
+    .map(
+      (s) => `<tr><td>${s.fraction === 1 ? s.n : s.fraction.toFixed(2)}</td><td>${fmt.clock(s.seconds / s.fraction)}</td><td>${fmt.clock(s.seconds)}</td></tr>`,
+    )
+    .join('');
+  return `
+    <header class="top"><button class="back" data-act="go" data-to="home">‹</button><h1>${fmt.date(r.startedAt)}</h1></header>
+    <div class="hero small"><b>${fmt.distance(r.distance, units)}</b><span>${u.label}</span></div>
+    <section class="card">
+      <div class="stats">
+        <div><b>${fmt.clock(r.seconds)}</b><span>Time</span></div>
+        <div><b>${fmt.paceFromSeconds(r.seconds, r.distance, units)}</b><span>Avg /${u.label}</span></div>
+        <div><b>${Math.round(r.cadence)}</b><span>Cadence</span></div>
+      </div>
+      ${compare}
+    </section>
+    <section class="card"><h3>Speed (${u.speed})</h3>${speedChart(r.timeline)}</section>
+    ${rows ? `<section class="card"><h3>Splits</h3><table class="splits"><thead><tr><th>${u.label}</th><th>Pace</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table></section>` : ''}
+    <button class="btn ghost danger wide" data-act="deleteRun" data-id="${r.id}">Delete run</button>`;
+}
+
+function speedChart(tl) {
+  if (tl.length < 10) return '<p class="hint">Not enough data.</p>';
+  const f = unit().speedFactor;
+  const pts = [];
+  const W = 30;
+  for (let i = W; i < tl.length; i += 5) {
+    const a = tl[i - W];
+    const b = tl[i];
+    if (b.t > a.t) pts.push([b.t, ((b.d - a.d) / (b.t - a.t)) * f]);
+  }
+  if (!pts.length) return '';
+  const tMax = tl[tl.length - 1].t;
+  const vMax = Math.ceil(Math.max(...pts.map((p) => p[1])) + 0.5);
+  const x = (t) => (t / tMax) * 300;
+  const y = (v) => 120 - (v / vMax) * 110;
+  const line = pts.map((p) => `${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join(' ');
+  return `<svg viewBox="0 0 300 130" class="chart" role="img" aria-label="Speed over time">
+    <line x1="0" x2="300" y1="${y(vMax)}" y2="${y(vMax)}" class="grid"/>
+    <line x1="0" x2="300" y1="${y(vMax / 2)}" y2="${y(vMax / 2)}" class="grid"/>
+    <text x="2" y="${y(vMax) + 11}" class="axis">${vMax}</text>
+    <text x="2" y="${y(vMax / 2) + 11}" class="axis">${(vMax / 2).toFixed(1)}</text>
+    <polyline points="${line}" class="series"/>
+    <text x="298" y="128" class="axis" text-anchor="end">${fmt.clock(tMax)}</text>
+  </svg>`;
+}
+
+function calibrate() {
+  const u = unit();
+  const m = S.model;
+  const obs = S.observations.filter((o) => o.source === source()).sort((a, b) => b.t - a.t);
+  const list = obs
+    .map((o) => {
+      const loo = m.error?.byId[o.id];
+      const err = loo ?? predict(m.beta, features(o.moments)) / o.distance - 1;
+      const what =
+        o.kind === 'segment'
+          ? `Segment · ${fmt.escape(o.label)} · ${fmt.clock(o.seconds)}`
+          : `Run · ${fmt.distance(o.distance, S.settings.units)} ${u.label}`;
+      return `<div class="obs ${o.include === false ? 'off' : ''}">
+        <label class="check-row"><input type="checkbox" data-act="toggleObs" data-id="${o.id}" ${o.include === false ? '' : 'checked'}>
+          <span><b>${what}</b><small>${fmt.date(o.t)}${o.include === false ? '' : ` · ${loo != null ? 'predicted' : 'fit'} ${fmt.percent(err)}`}</small></span>
+        </label>
+        <button class="x" data-act="deleteObs" data-id="${o.id}" aria-label="Delete">×</button>
+      </div>`;
+    })
+    .join('');
+  const h = S.settings.heightM;
+  const height =
+    S.settings.units === 'mi'
+      ? `<span class="row"><input id="hFt" type="number" inputmode="numeric" value="${Math.floor(h / 0.3048)}"> ft <input id="hIn" type="number" inputmode="numeric" value="${Math.round((h / 0.0254) % 12)}"> in</span>`
+      : `<span class="row"><input id="hCm" type="number" inputmode="numeric" value="${Math.round(h * 100)}"> cm</span>`;
+  return `
+    <header class="top"><h1>Calibrate</h1></header>
+    <section class="card">
+      ${
+        SIM
+          ? '<p class="hint">Simulator calibration is kept separate from your real runs.</p>'
+          : `<label class="field">Phone placement
+        <select id="placement">${Object.entries(PLACEMENTS)
+          .map(([k, v]) => `<option value="${k}" ${k === S.settings.placement ? 'selected' : ''}>${v}</option>`)
+          .join('')}</select>
+      </label>
+      <p class="hint">Each placement learns separately, so carry the phone the same way each run.</p>`
+      }
+      <p class="status">${calibrationLine()}</p>
+      ${calChart(obs)}
+    </section>
+    <section class="card">
+      <h3>How to calibrate</h3>
+      <ol class="steps">
+        <li><b>Fastest:</b> during a run, tap <i>Calibrate at this speed</i>, type the treadmill speed and hold it for 1–2 minutes. Do this at an easy, a moderate and a fast speed, plus a walk.</li>
+        <li><b>Every run:</b> type the treadmill's distance when you finish. Each run makes the next one more accurate.</li>
+      </ol>
+    </section>
+    <h2>Measurements</h2>
+    <div class="obs-list">${list || '<p class="empty">None yet.</p>'}</div>
+    <section class="card settings">
+      <h3>Settings</h3>
+      <label class="field">Units
+        <select id="units"><option value="mi" ${S.settings.units === 'mi' ? 'selected' : ''}>Miles</option><option value="km" ${S.settings.units === 'km' ? 'selected' : ''}>Kilometers</option></select>
+      </label>
+      <label class="field">Height ${height}</label>
+      <p class="hint">Height sets the starting guess before any calibration.</p>
+      <label class="check-row"><input id="voice" type="checkbox" ${S.settings.voice ? 'checked' : ''}> Announce splits</label>
+      <div class="row">
+        <button class="btn small ghost" data-act="export">Export data</button>
+        <label class="btn small ghost">Import<input id="import" type="file" accept="application/json" hidden></label>
+      </div>
+    </section>
+    ${nav('calibrate')}`;
+}
+
+// Speed vs cadence: the fitted model, the uncalibrated prior, and each
+// measurement's average.
+function calChart(obs) {
+  const f = unit().speedFactor;
+  const pri = prior(S.settings.heightM).mean;
+  const runObs = obs.filter((o) => o.include !== false && o.moments.run.n > 0);
+  const iRun = runObs.length
+    ? runObs.reduce((s, o) => s + o.moments.run.ni, 0) / runObs.reduce((s, o) => s + o.moments.run.n, 0)
+    : REF.run.i0;
+  const cMin = 100;
+  const cMax = 200;
+  const vMax = S.settings.units === 'mi' ? 12 : 20;
+  const x = (c) => ((c - cMin) / (cMax - cMin)) * 300;
+  const y = (v) => 150 - (v / vMax) * 140;
+  const curve = (beta, gait, c0, c1, i) => {
+    const pts = [];
+    for (let c = c0; c <= c1; c += 2) pts.push(`${x(c).toFixed(1)},${y(speed(beta, gait, c, i) * f).toFixed(1)}`);
+    return pts.join(' ');
+  };
+  const dots = obs
+    .filter((o) => o.include !== false)
+    .map((o) => {
+      const s = summarize(o.moments);
+      if (!(s.seconds > 0) || s.cadence < cMin || s.cadence > cMax) return '';
+      return `<circle cx="${x(s.cadence).toFixed(1)}" cy="${y((o.distance / s.seconds) * f).toFixed(1)}" r="4" class="${o.kind === 'segment' ? 'dot seg' : 'dot'}"/>`;
+    })
+    .join('');
+  const grid = [0.25, 0.5, 0.75]
+    .map((k) => `<line x1="0" x2="300" y1="${y(vMax * k)}" y2="${y(vMax * k)}" class="grid"/><text x="2" y="${y(vMax * k) - 3}" class="axis">${vMax * k}</text>`)
+    .join('');
+  return `<svg viewBox="0 0 300 170" class="chart" role="img" aria-label="Speed versus cadence">
+    ${grid}
+    <polyline points="${curve(pri, 'walk', 100, 138, REF.walk.i0)}" class="series prior"/>
+    <polyline points="${curve(pri, 'run', 140, 200, iRun)}" class="series prior"/>
+    <polyline points="${curve(S.model.beta, 'walk', 100, 138, REF.walk.i0)}" class="series"/>
+    <polyline points="${curve(S.model.beta, 'run', 140, 200, iRun)}" class="series"/>
+    ${dots}
+    <text x="0" y="166" class="axis">${cMin} spm</text><text x="300" y="166" class="axis" text-anchor="end">${cMax} spm</text>
+  </svg>
+  <p class="legend"><span><i class="key"></i>Your model</span><span><i class="key prior"></i>Starting guess</span><span><i class="key dot"></i>Measured (${unit().speed})</span></p>`;
+}
+
+// ---------- events ----------
+
+const actions = {
+  go: (el) => go(el.dataset.to),
+  enable: () => enableSensor(),
+  start: () => startRun(),
+  pause: () => togglePause(),
+  finish: () => finishRun(),
+  save: () => saveRun(),
+  discard: () => discardRun(),
+  resumeFinish: () => openFinish(S.unfinished),
+  dropUnfinished: async () => {
+    await store.deleteKv('activeRun');
+    S.unfinished = null;
+    render();
+  },
+  fillHint: () => {
+    $('treadmill').value = fmt.distance(S.finish.treadmillHint, S.settings.units);
+    updateCompare();
+  },
+  openRun: (el) => go('run', { runId: el.dataset.id }),
+  deleteRun: async (el) => {
+    if (!confirm('Delete this run? Its calibration measurement is deleted too.')) return;
+    await store.remove('runs', el.dataset.id);
+    await store.remove('observations', `run-${el.dataset.id}`);
+    S.runs = S.runs.filter((r) => r.id !== el.dataset.id);
+    S.observations = S.observations.filter((o) => o.id !== `run-${el.dataset.id}`);
+    refit();
+    go('home');
+  },
+  segOpen: () => {
+    S.active.segmentForm = true;
+    renderSegment();
+    $('segSpeed').focus();
+  },
+  segClose: () => {
+    S.active.segmentForm = false;
+    renderSegment();
+  },
+  segStart: () => startSegment(),
+  segEnd: () => endSegment(),
+  segCancel: () => {
+    S.active.segment = null;
+    renderSegment();
+  },
+  lock: () => {
+    S.locked = true;
+    $('lockLayer').hidden = false;
+  },
+  deleteObs: async (el) => {
+    if (!confirm('Delete this measurement?')) return;
+    await store.remove('observations', el.dataset.id);
+    S.observations = S.observations.filter((o) => o.id !== el.dataset.id);
+    refit();
+    render();
+  },
+  export: () => exportData(),
+};
+
+$app.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-act]');
+  if (!el || el.type === 'checkbox') return;
+  actions[el.dataset.act]?.(el);
+});
+
+$app.addEventListener('change', async (e) => {
+  const el = e.target;
+  if (el.dataset.act === 'toggleObs') {
+    const o = S.observations.find((x) => x.id === el.dataset.id);
+    o.include = el.checked;
+    await store.put('observations', o);
+    refit();
+    render();
+  } else if (el.id === 'placement') {
+    S.settings.placement = el.value;
+    saveSettings();
+    refit();
+    render();
+  } else if (el.id === 'units') {
+    S.settings.units = el.value;
+    S.settings.segmentSpeed = '';
+    saveSettings();
+    render();
+  } else if (['hFt', 'hIn', 'hCm'].includes(el.id)) {
+    const h = $('hCm') ? +$('hCm').value / 100 : +$('hFt').value * 0.3048 + +$('hIn').value * 0.0254;
+    if (h > 1 && h < 2.5) {
+      S.settings.heightM = h;
+      saveSettings();
+      refit();
+      render();
+    }
+  } else if (el.id === 'voice') {
+    S.settings.voice = el.checked;
+    saveSettings();
+  } else if (el.id === 'import') {
+    importData(el.files[0]);
+  }
+});
+
+$app.addEventListener('input', (e) => {
+  if (e.target.id === 'treadmill') updateCompare();
+});
+
+// Hold-to-unlock, so a pocketed phone can't pause or end the run by accident.
+let unlockTimer = null;
+$app.addEventListener('pointerdown', (e) => {
+  if (!e.target.closest('#unlock')) return;
+  $('unlock').classList.add('holding');
+  unlockTimer = setTimeout(() => {
+    S.locked = false;
+    $('lockLayer').hidden = true;
+    $('unlock').classList.remove('holding');
+  }, 1200);
+});
+const cancelUnlock = () => {
+  clearTimeout(unlockTimer);
+  $('unlock')?.classList.remove('holding');
+};
+$app.addEventListener('pointerup', cancelUnlock);
+$app.addEventListener('pointercancel', cancelUnlock);
+$app.addEventListener('pointerleave', cancelUnlock);
+
+function toast(text) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = text;
+  document.body.append(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// ---------- backup ----------
+
+function exportData() {
+  const data = { app: 'treadline', version: 1, settings: S.settings, runs: S.runs, observations: S.observations };
+  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `treadline-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+async function importData(file) {
+  try {
+    const data = JSON.parse(await file.text());
+    if (data.app !== 'treadline') throw new Error('Not a Treadline export');
+    for (const r of data.runs ?? []) await store.put('runs', r);
+    for (const o of data.observations ?? []) await store.put('observations', o);
+    S.runs = (await store.all('runs')).sort((a, b) => b.startedAt - a.startedAt);
+    S.observations = await store.all('observations');
+    refit();
+    render();
+    toast(`Imported ${data.runs?.length ?? 0} runs and ${data.observations?.length ?? 0} measurements`);
+  } catch (e) {
+    toast(`Import failed: ${e.message}`);
+  }
+}
+
+boot();
