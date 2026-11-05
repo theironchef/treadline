@@ -2,11 +2,12 @@
 
 A run tracker that runs as an installable web app (PWA) on your phone and
 **calibrates its step counting against your treadmill and against GPS**.
-Indoors it measures distance from the phone's accelerometer. You type the
-treadmill's distance after each run, or hold a known speed for a minute or
-two, and the app uses that to correct how it turns your steps into distance.
-Outdoors GPS measures the distance while the accelerometer records alongside,
-so every outdoor run also calibrates your next treadmill run.
+Each run is *Indoor* or *Outdoor*. Indoors it measures distance from the
+phone's accelerometer, with no GPS. You can type the treadmill's distance
+after a run (or laps × the track length), or hold a known treadmill speed for
+a minute or two, and the app uses that to correct how it turns your steps
+into distance. Outdoors GPS measures the distance while the accelerometer
+records alongside, so every outdoor run also calibrates your next indoor run.
 
 ## How it works
 
@@ -24,8 +25,9 @@ so every outdoor run also calibrates your next treadmill run.
    Distance is steps × step length. Before any calibration, the six
    coefficients come from your height.
 3. **Calibration.** Distance is linear in those six coefficients, so every
-   measurement becomes one equation. This includes a whole run with the
-   treadmill's distance, and a steady segment at a known treadmill speed.
+   measurement becomes one equation. This includes a whole indoor run with
+   the distance you typed in, and a steady segment at a known treadmill
+   speed.
    The app re-solves for the coefficients after each new measurement,
    staying close to the height-based guess wherever the data says little.
    Older measurements slowly lose weight (half-life 180 days), so the model
@@ -52,8 +54,9 @@ measurement keeps outdoor calibration honest.
 
 ## Using it
 
-- **Before you start,** pick *Treadmill* or *Outdoor* and spin the target
+- **Before you start,** pick *Indoor* or *Outdoor* and spin the target
   distance (0.0 for an open run). Outdoors, wait for the GPS dot to go green.
+  Indoors GPS stays off.
 - **Voice updates** at every mile (or km) give that mile's split and your
   average pace. You also hear one at halfway and when you reach the target.
 - **Carry the phone on your body:** front pocket, armband or waistband. On the
@@ -64,14 +67,15 @@ measurement keeps outdoor calibration honest.
   and **Lock screen** stops pocket taps (hold to unlock). Any time with no
   data is flagged, and that run is left out of calibration by default.
 - **Calibrate:**
-  - *Fastest:* during a run, tap **Calibrate at this speed**, type the
-    treadmill speed, hold it 1–2 minutes and tap **Save segment**. Do an
-    easy, a moderate and a fast pace, plus a walk.
-  - *Every run:* type the treadmill's distance on the finish screen.
-    A run that's more than 20% off is assumed bad (rails, phone moved) and
-    left out unless you tick it back in.
-  - *Outdoors:* nothing to type. Carry the phone the same way you do on the
-    treadmill, because each placement is calibrated separately.
+  - *Fastest, on a treadmill:* during an indoor run, tap **Calibrate at this
+    speed**, type the treadmill speed, hold it 1–2 minutes and tap **Save
+    segment**. Do an easy, a moderate and a fast pace, plus a walk.
+  - *Every indoor run:* on the finish screen, type the treadmill's distance,
+    or laps × the track length. It's optional; leave it blank if nothing
+    measured the run. A run that's more than 20% off is assumed bad (rails,
+    phone moved) and left out unless you tick it back in.
+  - *Outdoors:* nothing to type. Carry the phone the same way you do
+    indoors, because each placement is calibrated separately.
 - **Back up** with *Export data* on the Calibrate tab. Everything is stored
   only on the phone, in the browser's storage for this app.
 - Splits are announced by voice (turn it off on the Calibrate tab).

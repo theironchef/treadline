@@ -30,7 +30,7 @@ const S = {
     placement: 'pocket',
     voice: true,
     segmentSpeed: '',
-    mode: 'treadmill',
+    mode: 'indoor',
     targetM: 3 * UNITS.mi.meters,
   },
   runs: [],
@@ -65,6 +65,8 @@ async function boot() {
     store.getKv('activeRun'),
   ]);
   Object.assign(S.settings, settings);
+  // The previous version called indoor runs 'treadmill'.
+  if (S.settings.mode !== 'outdoor') S.settings.mode = 'indoor';
   S.runs = runs.sort((a, b) => b.startedAt - a.startedAt);
   S.observations = observations;
   S.unfinished = unfinished;
@@ -191,7 +193,7 @@ async function startRun() {
     startedAt: Date.now(),
     sessionId: sums.sessionId,
     source: source(),
-    mode: outdoor ? 'outdoor' : 'treadmill',
+    mode: outdoor ? 'outdoor' : 'indoor',
     target,
     track,
     chunker: outdoor ? new Chunker() : null,
@@ -205,7 +207,7 @@ async function startRun() {
   S.active.timers = [setInterval(syncSums, 3000), setInterval(saveActive, 10000)];
   S.locked = false;
   wakeLock(true);
-  speak(`${outdoor ? 'Outdoor' : 'Treadmill'} run started.${target ? ` Target ${fmt.spokenDistance(target, S.settings.units)}.` : ''}`);
+  speak(`${outdoor ? 'Outdoor' : 'Indoor'} run started.${target ? ` Target ${fmt.spokenDistance(target, S.settings.units)}.` : ''}`);
   go('live');
 }
 
@@ -282,21 +284,23 @@ function openFinish(saved) {
 async function saveRun() {
   const f = S.finish;
   const o = f.outdoor;
-  const typed = o ? NaN : parseFloat($('treadmill').value);
-  const treadmill = typed > 0 ? typed * unit().meters : null;
-  const distance = o ? o.distance : (treadmill ?? f.estimate);
+  const typed = o ? NaN : parseFloat($('measured').value);
+  const measured = typed > 0 ? typed * unit().meters : null;
+  const distance = o ? o.distance : (measured ?? f.estimate);
   const sum = summarize(f.sums.moments);
   const run = {
     id: f.id,
     startedAt: f.startedAt,
     source: f.source,
-    mode: o ? 'outdoor' : 'treadmill',
+    mode: o ? 'outdoor' : 'indoor',
     target: f.target ?? 0,
     seconds: f.sums.elapsedMs / 1000,
     gapSeconds: f.sums.gapMs / 1000,
     distance,
     estimate: f.estimate,
-    treadmill: !!treadmill,
+    // A distance typed in from a treadmill or track. The name predates
+    // indoor runs that aren't on a treadmill.
+    treadmill: !!measured,
     gps: o?.gpsOk ? { accuracy: f.gps.accuracySum / f.gps.fixes, gapSeconds: f.gps.gapMs / 1000 } : null,
     steps: f.sums.steps,
     cadence: sum.cadence,
@@ -306,8 +310,8 @@ async function saveRun() {
   await store.put('runs', run);
   S.runs.unshift(run);
   const base = { runId: f.id, source: f.source, t: f.startedAt, include: $('useCal').checked };
-  const obs = treadmill
-    ? [{ ...base, id: `run-${f.id}`, kind: 'run', moments: f.sums.moments, distance: treadmill, seconds: run.seconds, sigma: 0.01 }]
+  const obs = measured
+    ? [{ ...base, id: `run-${f.id}`, kind: 'run', moments: f.sums.moments, distance: measured, seconds: run.seconds, sigma: 0.01 }]
     : (o?.good ?? []).map((c, k) => ({
         ...base,
         id: `gps-${f.id}-${k}`,
@@ -462,7 +466,7 @@ function home() {
     .slice(0, 30)
     .map(
       (r) => `<button class="run-row" data-act="openRun" data-id="${r.id}">
-        <span class="run-date">${fmt.date(r.startedAt)}<small>${r.mode === 'outdoor' ? 'Outdoor' : 'Treadmill'} · ${fmt.time(r.startedAt)}</small></span>
+        <span class="run-date">${fmt.date(r.startedAt)}<small>${r.mode === 'outdoor' ? 'Outdoor' : 'Indoor'} · ${fmt.time(r.startedAt)}</small></span>
         <span class="run-dist">${fmt.distance(r.distance, S.settings.units)}<small>${u.label}</small></span>
         <span class="run-meta">${fmt.clock(r.seconds)}<small>${fmt.paceFromSeconds(r.seconds, r.distance, S.settings.units)} /${u.label}</small></span>
       </button>`,
@@ -475,7 +479,7 @@ function home() {
   return `
     <header class="top"><h1>Treadline</h1>${SIM ? '<span class="pill">Simulator</span>' : ''}</header>
     ${unfinished}
-    <div class="mode" role="radiogroup" aria-label="Where you're running">${modeBtn('treadmill', 'Treadmill')}${modeBtn('outdoor', 'Outdoor')}</div>
+    <div class="mode" role="radiogroup" aria-label="Where you're running">${modeBtn('indoor', 'Indoor')}${modeBtn('outdoor', 'Outdoor')}</div>
     <section class="card target">
       <div class="sensor-head"><span class="label">Target distance</span><span id="targetNote" class="label"></span></div>
       <div class="picker">
@@ -496,12 +500,12 @@ function home() {
         SIM
           ? 'A simulated runner follows a program: 3 min walk, then 6, 7 and 6.5 mph.'
           : outdoor
-            ? 'GPS measures the distance. The accelerometer records too, and steady stretches calibrate it for the treadmill.'
+            ? 'GPS measures the distance. The accelerometer records too, and steady stretches calibrate it for indoor runs.'
             : 'Put the phone where it will ride during the run and walk around. The cadence here should match your steps.'
       }</p>
       ${S.link?.connected ? '' : '<button class="btn small" data-act="enable">Enable motion sensor</button>'}
     </section>
-    <button class="btn start" data-act="start">Start ${outdoor ? 'outdoor' : 'treadmill'} run</button>
+    <button class="btn start" data-act="start">Start ${outdoor ? 'outdoor' : 'indoor'} run</button>
     <button class="cal-line" data-act="go" data-to="calibrate">${calibrationLine()} →</button>
     <h2>Runs</h2>
     <div class="runs">${runs || '<p class="empty">No runs yet.</p>'}</div>
@@ -693,7 +697,7 @@ function updateLive() {
 }
 
 function finish() {
-  return S.finish.outdoor ? finishOutdoor() : finishTreadmill();
+  return S.finish.outdoor ? finishOutdoor() : finishIndoor();
 }
 
 function finishOutdoor() {
@@ -714,7 +718,7 @@ function finishOutdoor() {
     : `<p class="hint">On its own, the accelerometer measured ${fmt.distance(f.estimate, units)} ${u.label}: ${(Math.abs(err) * 100).toFixed(1)}% ${err > 0 ? 'long' : 'short'} of GPS.</p>
       ${
         o.good.length
-          ? `<p class="hint">${fmt.distance(usedM, units)} ${u.label} had steady GPS and step data, in ${o.good.length} ${o.good.length === 1 ? 'stretch' : 'stretches'}. Those calibrate the accelerometer for treadmill runs.</p>`
+          ? `<p class="hint">${fmt.distance(usedM, units)} ${u.label} had steady GPS and step data, in ${o.good.length} ${o.good.length === 1 ? 'stretch' : 'stretches'}. Those calibrate the accelerometer for indoor runs.</p>`
           : '<p class="warn">GPS or step data was too patchy to calibrate from this run.</p>'
       }`;
   return `
@@ -739,7 +743,10 @@ function finishOutdoor() {
     </div>`;
 }
 
-function finishTreadmill() {
+// Indoors the steps measured the run. A treadmill's readout, or laps times
+// the track length, is optional; given one, the app learns from the
+// difference.
+function finishIndoor() {
   const f = S.finish;
   const u = unit();
   const units = S.settings.units;
@@ -760,11 +767,11 @@ function finishTreadmill() {
     </section>
     ${gap > 0 ? `<p class="warn">${fmt.clock(gap)} of this run had no sensor data, so the estimate is short. It is left out of calibration unless you tick the box.</p>` : ''}
     <section class="card">
-      <label class="field">Treadmill distance
-        <span class="input-unit"><input id="treadmill" type="number" inputmode="decimal" step="0.01" min="0" placeholder="${fmt.distance(f.estimate, units)}"><span>${u.label}</span></span>
+      <label class="field">Treadmill or track distance (optional)
+        <span class="input-unit"><input id="measured" type="number" inputmode="decimal" step="0.01" min="0" placeholder="${fmt.distance(f.estimate, units)}"><span>${u.label}</span></span>
       </label>
       ${hint}
-      <p id="compare" class="hint">Enter what the treadmill shows. The app learns from the difference.</p>
+      <p id="compare" class="hint">${COMPARE_HINT}</p>
       <label class="check-row"><input id="useCal" type="checkbox" ${gap > 0 ? '' : 'checked'}> Use this run to calibrate</label>
     </section>
     <div class="row end">
@@ -773,12 +780,15 @@ function finishTreadmill() {
     </div>`;
 }
 
+const COMPARE_HINT =
+  'If a treadmill measured the run, enter what it shows. On a track, enter laps × the track length. The app learns from the difference.';
+
 function updateCompare() {
   const f = S.finish;
-  const typed = parseFloat($('treadmill').value);
+  const typed = parseFloat($('measured').value);
   const el = $('compare');
   if (!(typed > 0)) {
-    el.textContent = 'Enter what the treadmill shows. The app learns from the difference.';
+    el.textContent = COMPARE_HINT;
     el.className = 'hint';
     return;
   }
@@ -786,7 +796,7 @@ function updateCompare() {
   const off = Math.abs(err) > 0.2;
   el.className = off ? 'warn' : 'hint';
   el.textContent = off
-    ? `The estimate is ${fmt.percent(err)} off the treadmill. That big a gap usually means the phone moved or you held the rails, so this run is left out of calibration.`
+    ? `The estimate is ${(Math.abs(err) * 100).toFixed(1)}% ${err > 0 ? 'long' : 'short'}. That big a gap usually means the phone moved or you held the rails, so this run is left out of calibration.`
     : `The app's estimate was ${(Math.abs(err) * 100).toFixed(1)}% ${err > 0 ? 'long' : 'short'}.`;
   if (off) $('useCal').checked = false;
 }
@@ -802,8 +812,8 @@ function runDetail() {
     : r.mode === 'outdoor'
       ? '<p class="hint">Outdoor run without a GPS fix, so this is the accelerometer’s estimate.</p>'
       : r.treadmill
-        ? `<p class="hint">App estimate ${fmt.distance(r.estimate, units)} ${u.label} (${fmt.percent(r.estimate / r.distance - 1)}) vs treadmill ${fmt.distance(r.distance, units)} ${u.label}.</p>`
-        : '<p class="hint">Saved without a treadmill distance, so this is the app’s estimate.</p>';
+        ? `<p class="hint">App estimate ${fmt.distance(r.estimate, units)} ${u.label} (${fmt.percent(r.estimate / r.distance - 1)}) vs the ${fmt.distance(r.distance, units)} ${u.label} you entered.</p>`
+        : '<p class="hint">Saved without a measured distance, so this is the app’s estimate.</p>';
   const rows = sp
     .map(
       (s) => `<tr><td>${s.fraction === 1 ? s.n : s.fraction.toFixed(2)}</td><td>${fmt.clock(s.seconds / s.fraction)}</td><td>${fmt.clock(s.seconds)}</td></tr>`,
@@ -878,7 +888,7 @@ function calibrate() {
           ? `Segment · ${fmt.escape(o.label)} · ${fmt.clock(o.seconds)}`
           : o.kind === 'gps'
             ? `Outdoor run · ${fmt.distance(meters, S.settings.units)} ${u.label} by GPS`
-            : `Run · ${fmt.distance(o.distance, S.settings.units)} ${u.label}`;
+            : `Indoor run · ${fmt.distance(o.distance, S.settings.units)} ${u.label}`;
       const ids = g.map((x) => x.id).join(',');
       const on = o.include !== false;
       return `<div class="obs ${on ? '' : 'off'}">
@@ -913,9 +923,9 @@ function calibrate() {
     <section class="card">
       <h3>How to calibrate</h3>
       <ol class="steps">
-        <li><b>Fastest:</b> during a run, tap <i>Calibrate at this speed</i>, type the treadmill speed and hold it for 1–2 minutes. Do this at an easy, a moderate and a fast speed, plus a walk.</li>
-        <li><b>Every run:</b> type the treadmill's distance when you finish. Each run makes the next one more accurate.</li>
-        <li><b>Outdoors:</b> run in Outdoor mode with the phone carried the same way. GPS measures the distance, and every steady half mile or so calibrates the accelerometer automatically. Treadmill strides can differ a little from road strides, so a treadmill measurement now and then keeps it honest.</li>
+        <li><b>Fastest, on a treadmill:</b> during an indoor run, tap <i>Calibrate at this speed</i>, type the treadmill speed and hold it for 1–2 minutes. Do this at an easy, a moderate and a fast speed, plus a walk.</li>
+        <li><b>Every indoor run:</b> when you finish, type the distance the treadmill shows, or laps × the track length. Each run makes the next one more accurate.</li>
+        <li><b>Outdoors:</b> run in Outdoor mode with the phone carried the same way. GPS measures the distance, and every steady half mile or so calibrates the accelerometer automatically. Treadmill strides can differ a little from road strides, so an indoor measurement now and then keeps it honest.</li>
       </ol>
     </section>
     <h2>Measurements</h2>
@@ -995,7 +1005,7 @@ const actions = {
     render();
   },
   fillHint: () => {
-    $('treadmill').value = fmt.distance(S.finish.simTruth, S.settings.units);
+    $('measured').value = fmt.distance(S.finish.simTruth, S.settings.units);
     updateCompare();
   },
   mode: (el) => {
@@ -1094,7 +1104,7 @@ $app.addEventListener('change', async (e) => {
 });
 
 $app.addEventListener('input', (e) => {
-  if (e.target.id === 'treadmill') updateCompare();
+  if (e.target.id === 'measured') updateCompare();
 });
 
 // Hold-to-unlock, so a pocketed phone can't pause or end the run by accident.
